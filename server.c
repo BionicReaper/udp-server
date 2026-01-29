@@ -45,6 +45,7 @@ static int receiver_terminated = 0;
 static int swapper_terminated = 0;
 static int producer_terminated = 0;
 static char terminate_buffer[9] = {0};
+static pthread_t pinger_thread_id;
 
 void swap_queues() {
     /* Swap receiver/consumer queues */
@@ -187,6 +188,8 @@ void receiver() {
                 pthread_mutex_lock(&recv_mutex);
                 receiver_terminated = 1;
                 pthread_mutex_unlock(&recv_mutex);
+                /* Cancel pinger thread to wake it immediately */
+                pthread_cancel(pinger_thread_id);
                 close(sockfd);
                 printf("Receiver terminating...\n");
                 fflush(stdout);
@@ -307,6 +310,43 @@ void sender() {
     return;
 }
 
+void pinger() {
+    int sockfd;
+    const char *ping_msg = "PING";
+
+    /* Create socket for sending pings */
+    sockfd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("pinger socket failed");
+        exit(1);
+    }
+
+    while (1) {
+        /* Sleep for 15 seconds */
+        sleep(15);
+
+        /* Check if we should terminate */
+        int should_exit = receiver_terminated;
+
+        if (should_exit) {
+            printf("Pinger terminating...\n");
+            fflush(stdout);
+            close(sockfd);
+            return;
+        }
+
+        /* Send PING to all active subscribers */
+        for (int i = 0; i < 512; i++) {
+            if (subscribers[i].active) {
+                sendto(sockfd, ping_msg, strlen(ping_msg), 0,
+                       (struct sockaddr*)&subscribers[i].addr,
+                       subscribers[i].addr_len);
+            }
+        }
+    }
+    return;
+}
+
 void consumer() {
     char cmd[16];
     while (1) {
@@ -364,7 +404,7 @@ int main() {
     producer_q = &qC;
     sender_q = &qD;
 
-    pthread_t recv_thread, swap_thread, cons_thread, send_thread;
+    pthread_t recv_thread, swap_thread, cons_thread, send_thread, ping_thread;
 
     if (pthread_create(&recv_thread, NULL, (void *(*)(void *))receiver, NULL) != 0) {
         perror("pthread_create receiver");
@@ -382,12 +422,18 @@ int main() {
         perror("pthread_create sender");
         return 1;
     }
+    if (pthread_create(&ping_thread, NULL, (void *(*)(void *))pinger, NULL) != 0) {
+        perror("pthread_create pinger");
+        return 1;
+    }
+    pinger_thread_id = ping_thread;
 
     /* Join threads */
     pthread_join(recv_thread, NULL);
     pthread_join(swap_thread, NULL);
     pthread_join(cons_thread, NULL);
     pthread_join(send_thread, NULL);
+    pthread_join(ping_thread, NULL);
 
     printf("\nServer terminated.\n");
 

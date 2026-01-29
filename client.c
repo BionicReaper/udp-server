@@ -30,6 +30,11 @@ void *receiver_thread(void *arg) {
         }
         buffer[n] = '\0';
 
+        /* Ignore PING messages */
+        if (strcmp(buffer, "PING") == 0) {
+            continue;
+        }
+
         /* Check if it's a TERMINATE command from server */
         if (strcmp(buffer, "TERMINATE") == 0) {
             tcsetattr(STDIN_FILENO, TCSAFLUSH, args->orig_termios);
