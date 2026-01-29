@@ -30,8 +30,16 @@ void *receiver_thread(void *arg) {
         }
         buffer[n] = '\0';
 
-        /* Ignore PING messages */
+        /* Send PONG response to PING */
         if (strcmp(buffer, "PING") == 0) {
+            const char *pong = "PONG";
+            struct sockaddr_in6 server_addr;
+            memset(&server_addr, 0, sizeof(server_addr));
+            server_addr.sin6_family = AF_INET6;
+            server_addr.sin6_port = htons(53847);
+            memcpy(&server_addr.sin6_addr, &from_addr.sin6_addr, sizeof(struct in6_addr));
+            sendto(args->sockfd, pong, strlen(pong), 0,
+                   (struct sockaddr*)&server_addr, sizeof(server_addr));
             continue;
         }
 
