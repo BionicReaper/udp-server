@@ -13,9 +13,23 @@ typedef struct connection_info {
     struct sockaddr_in6 addr;
     socklen_t addr_len;
     short active;
+    short pinged;
 } conn_info;
 
 conn_info subscribers[512];
+
+typedef struct pong_response {
+    struct sockaddr_in6 addr;
+    socklen_t addr_len;
+} pong_resp;
+
+typedef struct pinger_queue {
+    pong_resp responses[512];
+    int head;
+    int tail;
+} pinger_q;
+
+pinger_q ping_queue;
 
 typedef struct command_queue {
     char commands[512][16];
@@ -39,6 +53,7 @@ static pthread_mutex_t recv_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cons_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t send_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t prod_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t ping_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t recv_swap_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t send_swap_cond = PTHREAD_COND_INITIALIZER;
 static int receiver_terminated = 0;
@@ -78,6 +93,39 @@ void swap_queues() {
 void init_queue(cmd_q *q) {
     q->head = 0;
     q->tail = 0;
+}
+
+void init_pinger_queue(pinger_q *q) {
+    q->head = 0;
+    q->tail = 0;
+}
+
+int enqueue_pong(pinger_q *q, const struct sockaddr_in6 *addr, socklen_t addr_len) {
+    int rc = 0;
+    pthread_mutex_lock(&ping_mutex);
+    if (((q->tail + 1) & 511) == q->head) {
+        rc = -1;
+    } else {
+        memcpy(&q->responses[q->tail].addr, addr, sizeof(struct sockaddr_in6));
+        q->responses[q->tail].addr_len = addr_len;
+        q->tail = (q->tail + 1) & 511;
+    }
+    pthread_mutex_unlock(&ping_mutex);
+    return rc;
+}
+
+int dequeue_pong(pinger_q *q, pong_resp * resp) {
+    int rc = 0;
+    pthread_mutex_lock(&ping_mutex);
+    if (q->head == q->tail) {
+        rc = -1;
+    } else {
+        memcpy(&resp->addr, &q->responses[q->head].addr, sizeof(struct sockaddr_in6));
+        resp->addr_len = q->responses[q->head].addr_len;
+        q->head = (q->head + 1) & 511;
+    }
+    pthread_mutex_unlock(&ping_mutex);
+    return rc;
 }
 
 int enqueue(cmd_q *q, const char *cmd, pthread_mutex_t *mutex) {
@@ -140,6 +188,8 @@ void receiver() {
             continue;
         }
 
+        buffer[n] = '\0';
+
         if (strcmp(buffer, "LOGIN") == 0) {
             /* Register new subscriber if not already present */
             int found = 0;
@@ -173,7 +223,12 @@ void receiver() {
             }
             continue;
         }
-        buffer[n] = '\0';
+        
+        if (strcmp(buffer, "PONG") == 0) {
+            /* Enqueue PONG response with sender's address */
+            enqueue_pong(&ping_queue, &client_addr, addr_len);
+            continue;
+        }
 
         enqueue(receiver_q, buffer, &recv_mutex);
 
@@ -325,6 +380,32 @@ void pinger() {
         /* Sleep for 15 seconds */
         sleep(15);
 
+        int response_count = 0;
+        pong_resp responses[512];
+        while(dequeue_pong(&ping_queue, &responses[response_count]) == 0) {
+            response_count++;
+            if (response_count >= 512)
+            exit(10);
+        }
+
+        for(int i = 0; i < 512; i++) {
+            /* Mark subscriber as pinged */
+            if(subscribers[i].active && subscribers[i].pinged) {
+                int ponged = 0;
+                for(int j = 0; j < response_count; j++) {
+                    if (memcmp(&subscribers[i].addr, &responses[j].addr, sizeof(struct sockaddr_in6)) == 0) {
+                        ponged = 1;
+                        break;
+                    }
+                }
+                if (!ponged) {
+                    subscribers[i].active = 0;
+                    subscribers[i].pinged = 0;
+                    printf("Subscriber timed out and removed.\n");
+                    fflush(stdout);
+                }
+            }
+        }
         /* Check if we should terminate */
         int should_exit = receiver_terminated;
 
@@ -338,6 +419,7 @@ void pinger() {
         /* Send PING to all active subscribers */
         for (int i = 0; i < 512; i++) {
             if (subscribers[i].active) {
+                subscribers[i].pinged = 1;
                 sendto(sockfd, ping_msg, strlen(ping_msg), 0,
                        (struct sockaddr*)&subscribers[i].addr,
                        subscribers[i].addr_len);
@@ -394,11 +476,13 @@ void consumer() {
 int main() {
     for(int i = 0; i < 512; i++) {
         subscribers[i].active = 0;
+        subscribers[i].pinged = 0;
     }
     init_queue(&qA);
     init_queue(&qB);
     init_queue(&qC);
     init_queue(&qD);
+    init_pinger_queue(&ping_queue);
     receiver_q = &qA;
     consumer_q = &qB;
     producer_q = &qC;
