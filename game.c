@@ -24,12 +24,12 @@ void initProjectileQueue(ProjectileQueue *queue) {
 
 void enqueueProjectile(ProjectileQueue *queue, Projectile proj) {
     queue->projectiles[queue->tail] = proj;
-    queue->tail = (queue->tail + 1) % 256;
+    queue->tail = (queue->tail + 1) % 64;
 }
 
 void dequeueProjectile(ProjectileQueue *queue) {
     if (queue->head != queue->tail) {
-        queue->head = (queue->head + 1) % 256;
+        queue->head = (queue->head + 1) % 64;
     }
 }
 
@@ -535,7 +535,7 @@ void drawProjectiles(ProjectileQueue *queue) {
                     &screen
                 );
         }
-        index = (index + 1) % 256;
+        index = (index + 1) % 64;
     }
 }
 
@@ -547,7 +547,7 @@ void printProjectiles(ProjectileQueue *queue) {
         Projectile proj = queue->projectiles[index];
         printf("Projectile at index %d: Position(%.2f, %.2f, %.2f), Distance left: %.2f, Collided: %d\n",
                index, proj.position.x, proj.position.y, proj.position.z, proj.distance_left, proj.collided);
-        index = (index + 1) % 256;
+        index = (index + 1) % 64;
     }
 }
 
@@ -598,7 +598,7 @@ void updateProjectiles(ProjectileQueue *queue, Player *players, int numPlayers, 
                 dequeueProjectile(queue);
             }
         }
-        index = (index + 1) % 256;
+        index = (index + 1) % 64;
     }
 }
 

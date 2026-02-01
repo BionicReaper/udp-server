@@ -44,20 +44,20 @@ typedef struct {
     double width, height, depth;
     double rotation_y;
     Color color;
-} Cuboid;
+} Cuboid; //59 Bytes
 
 typedef struct {
     Vec3 position;
     double length;
     double rotation_y;
     Color color;
-} Gun;
+} Gun; //29 Bytes
 
 typedef struct {
     Cuboid cuboid;
     Gun gun;
     short hp;
-} Player;
+} Player; // 90 Bytes
 
 typedef struct {
     Vec3 position;
@@ -73,10 +73,10 @@ typedef struct {
     double speed;
     Player * owner;
     short collided;
-} Projectile;
+} Projectile; // 72 Bytes
 
 typedef struct {
-    Projectile projectiles[256];
+    Projectile projectiles[64];
     int head;
     int tail;
 } ProjectileQueue;
