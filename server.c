@@ -473,6 +473,27 @@ void consumer() {
     return;
 }
 
+void ctrlcHandler(int signum) {
+    // Create socket for sending TERMINATE
+    int sockfd = socket(AF_INET6, SOCK_DGRAM, 0);;
+    if (sockfd < 0) {
+        perror("ctrlcHandler socket failed");
+        exit(1);
+    }
+    // Broadcast TERMINATE command to all subscribers
+    const char *terminate = "TERMINATE";
+    for (int i = 0; i < 512; i++) {
+        if (subscribers[i].active) {
+            sendto(sockfd, terminate, strlen(terminate), 0,
+                (struct sockaddr*)&subscribers[i].addr,
+                subscribers[i].addr_len);
+        }
+    }
+    printf("\nCTRL-C detected. TERMINATE commands sent to subscribers. Exiting.\n");
+    fflush(stdout);
+    exit(0);
+}
+
 int main() {
     for(int i = 0; i < 512; i++) {
         subscribers[i].active = 0;
