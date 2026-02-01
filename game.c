@@ -33,9 +33,9 @@ void dequeueProjectile(ProjectileQueue *queue) {
     }
 }
 
-void initPlayers(Player * players, int numPlayers){
+void initPlayers(Player * players, short numPlayers){
     // Set hp to 0
-    for(int i = 0; i < numPlayers; i++){
+    for(short i = 0; i < numPlayers; i++){
         players->hp = 0;
     }
 }
@@ -473,9 +473,9 @@ void drawPlayer(const Player player) {
     drawCuboid(topRight);
 }
 
-void movePlayer(Player *player, double forward, double right, double up, short globalCoordinates) {
+void movePlayer(short playerID, double forward, double right, double up, short globalCoordinates) {
     // Calculate forward and right vectors based on cuboid rotation (forward is z-axis)
-    double yaw = globalCoordinates ? 0 : player->cuboid.rotation_y;
+    double yaw = globalCoordinates ? 0 : players[playerID].cuboid.rotation_y;
     Vec3 forwardVec = {
         .x = sin(yaw),
         .y = 0,
@@ -488,23 +488,23 @@ void movePlayer(Player *player, double forward, double right, double up, short g
     };
 
     // Update position
-    player->cuboid.position.x += forward * forwardVec.x + right * rightVec.x;
-    player->cuboid.position.y += up;
-    player->cuboid.position.z += forward * forwardVec.z + right * rightVec.z;
+    players[playerID].cuboid.position.x += forward * forwardVec.x + right * rightVec.x;
+    players[playerID].cuboid.position.y += up;
+    players[playerID].cuboid.position.z += forward * forwardVec.z + right * rightVec.z;
 
     // Update gun position to match cuboid
-    player->gun.position = player->cuboid.position;
-    player->gun.position.y -= player->cuboid.height / 4.0; // Adjust gun height
+    players[playerID].gun.position = players[playerID].cuboid.position;
+    players[playerID].gun.position.y -= players[playerID].cuboid.height / 4.0; // Adjust gun height
 }
 
-void rotatePlayer(Player *player, double delta_yaw) {
-    player->cuboid.rotation_y += delta_yaw;
-    player->gun.rotation_y += delta_yaw;
+void rotatePlayer(short playerID, double delta_yaw) {
+    players[playerID].cuboid.rotation_y += delta_yaw;
+    players[playerID].gun.rotation_y += delta_yaw;
 }
 
-void changePlayerColor(Player *player, Color newColor) {
-    player->cuboid.color = newColor;
-    player->gun.color = newColor;
+void changePlayerColor(short playerID, Color newColor) {
+    players[playerID].cuboid.color = newColor;
+    players[playerID].gun.color = newColor;
 }
 
 void drawProjectiles(ProjectileQueue *queue) {
@@ -551,22 +551,22 @@ void printProjectiles(ProjectileQueue *queue) {
     }
 }
 
-void shootProjectile(Player *player, ProjectileQueue *queue) {
+void shootProjectile(short playerID, ProjectileQueue *queue) {
     Projectile proj;
-    proj.position = player->gun.position;
+    proj.position = players[playerID].gun.position;
     proj.length = 3.0;
-    proj.rotation_y = player->gun.rotation_y;
+    proj.rotation_y = players[playerID].gun.rotation_y;
     proj.color = (Color){255, 255, 255};
     proj.distance_left = PROJECTILE_TRAVEL_DISTANCE;
     proj.speed = PROJECTILE_TRAVEL_SPEED;
-    proj.owner = player;
+    proj.ownerID = playerID;
     proj.collided = 0;
 
     enqueueProjectile(queue, proj);
 }
 
-void updateProjectiles(ProjectileQueue *queue, Player *players, int numPlayers, double deltaTime) {
-    int index = queue->head;
+void updateProjectiles(ProjectileQueue *queue, Player *players, short numPlayers, double deltaTime) {
+    short index = queue->head;
     while (index != queue->tail) {
         Projectile *proj = &queue->projectiles[index];
         if(proj->collided == 1){
@@ -580,12 +580,12 @@ void updateProjectiles(ProjectileQueue *queue, Player *players, int numPlayers, 
             proj->distance_left -= proj->speed * deltaTime;
 
             // Check for collisions with players
-            for (int i = 0; i < numPlayers; i++) {
-                if (&players[i] != proj->owner && players[i].hp > 0) {
+            for (short i = 0; i < numPlayers; i++) {
+                if (i != proj->ownerID && players[i].hp > 0) {
                     if (projectileCuboidCollision(*proj, players[i].cuboid)) {
                         // Collision detected
                         players[i].hp -= 1; // Decrease HP by 1
-                        changePlayerColor(&players[i], (Color){players[i].cuboid.color.red + 51, players[i].cuboid.color.green - 51, 0});
+                        changePlayerColor(i, (Color){players[i].cuboid.color.red + 51, players[i].cuboid.color.green - 51, 0});
                         // Remove projectile
                         proj->collided = 1;
                         break;
@@ -802,7 +802,7 @@ int main() {
         clearScreen();
         
         // Apply FPS-invariant movement and rotation
-        movePlayer(player, MOVE_SPEED * delta_time, 0.0, 0.0, 1);
+        movePlayer(0, MOVE_SPEED * delta_time, 0.0, 0.0, 1);
         //rotatePlayer(player, ROTATION_SPEED * delta_time);
 
         moveCamera(
@@ -815,8 +815,8 @@ int main() {
         setCameraRotation(-PI/2);
 
         if(i % 1000 == 0 && i > 0){
-            shootProjectile(cameraPlayer, &projectileQueue);
-            //shootProjectile(player, &projectileQueue);
+            shootProjectile(1, &projectileQueue);
+            //shootProjectile(0, &projectileQueue);
         }
         updateProjectiles(&projectileQueue, &players[0], 16, delta_time);
         drawProjectiles(&projectileQueue);

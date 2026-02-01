@@ -71,14 +71,14 @@ typedef struct {
     Color color;
     double distance_left;
     double speed;
-    Player * owner;
+    short ownerID;
     short collided;
 } Projectile; // 72 Bytes
 
 typedef struct {
     Projectile projectiles[64];
-    int head;
-    int tail;
+    short head;
+    short tail;
 } ProjectileQueue;
 
 typedef struct {
@@ -107,7 +107,7 @@ void setActiveMSAA(short activate);
 void initProjectileQueue(ProjectileQueue *queue);
 void enqueueProjectile(ProjectileQueue *queue, Projectile proj);
 void dequeueProjectile(ProjectileQueue *queue);
-void initPlayers(Player * players, int numPlayers);
+void initPlayers(Player * players, short numPlayers);
 Vec3 rotateY(Vec3 v, double theta);
 int projectileCuboidCollision(Projectile proj, Cuboid cuboid);
 Color blend(Color dst, Color src, float a);
@@ -116,13 +116,13 @@ void drawLineZ(Vec3 c0, Vec3 c1, int width, int height, Color lineColor, FrameBu
 void drawCuboid(const Cuboid cuboid);
 void drawGun(const Gun gun);
 void drawPlayer(const Player player);
-void movePlayer(Player *player, double forward, double right, double up, short globalCoordinates);
-void rotatePlayer(Player *player, double delta_yaw);
-void changePlayerColor(Player *player, Color newColor);
+void movePlayer(short playerID, double forward, double right, double up, short globalCoordinates);
+void rotatePlayer(short playerID, double delta_yaw);
+void changePlayerColor(short playerID, Color newColor);
 void drawProjectiles(ProjectileQueue *queue);
 void printProjectiles(ProjectileQueue *queue);
-void shootProjectile(Player *player, ProjectileQueue *queue);
-void updateProjectiles(ProjectileQueue *queue, Player *players, int numPlayers, double deltaTime);
+void shootProjectile(short playerID, ProjectileQueue *queue);
+void updateProjectiles(ProjectileQueue *queue, Player *players, short numPlayers, double deltaTime);
 void clearScreen();
 void generateframeString();
 void applyAA();
