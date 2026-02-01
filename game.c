@@ -11,7 +11,7 @@ FrameBuffer screen;
 FrameBuffer antiAliased;
 char frameString[7 + HEIGHT * WIDTH * (21) + HEIGHT + 1 + 4];
 unsigned long frameStringSize;
-short activeMSAA = 0;
+short activeMSAA = 1;
 
 void setActiveMSAA(short activate){
     activeMSAA = activate;
@@ -473,6 +473,14 @@ void drawPlayer(const Player player) {
     drawCuboid(topRight);
 }
 
+void drawAllPlayers() {
+    for (short i = 0; i < 16; i++) {
+        if (players[i].hp > 0) {
+            drawPlayer(players[i]);
+        }
+    }
+}
+
 void movePlayer(short playerID, double forward, double right, double up, short globalCoordinates) {
     // Calculate forward and right vectors based on cuboid rotation (forward is z-axis)
     double yaw = globalCoordinates ? 0 : players[playerID].cuboid.rotation_y;
@@ -565,7 +573,7 @@ void shootProjectile(short playerID, ProjectileQueue *queue) {
     enqueueProjectile(queue, proj);
 }
 
-void updateProjectiles(ProjectileQueue *queue, Player *players, short numPlayers, double deltaTime) {
+void updateProjectiles(ProjectileQueue *queue, Player *players, short numPlayers, double deltaTime, short checkCollisions, CollisionCallback onCollision) {
     short index = queue->head;
     while (index != queue->tail) {
         Projectile *proj = &queue->projectiles[index];
@@ -579,16 +587,24 @@ void updateProjectiles(ProjectileQueue *queue, Player *players, short numPlayers
             proj->position.z += cos(proj->rotation_y) * proj->speed * deltaTime;
             proj->distance_left -= proj->speed * deltaTime;
 
-            // Check for collisions with players
-            for (short i = 0; i < numPlayers; i++) {
-                if (i != proj->ownerID && players[i].hp > 0) {
-                    if (projectileCuboidCollision(*proj, players[i].cuboid)) {
-                        // Collision detected
-                        players[i].hp -= 1; // Decrease HP by 1
-                        changePlayerColor(i, (Color){players[i].cuboid.color.red + 51, players[i].cuboid.color.green - 51, 0});
-                        // Remove projectile
-                        proj->collided = 1;
-                        break;
+            // Check for collisions with players (only on server)
+            if (checkCollisions) {
+                for (short i = 0; i < numPlayers; i++) {
+                    if (i != proj->ownerID && players[i].hp > 0) {
+                        if (projectileCuboidCollision(*proj, players[i].cuboid)) {
+                            // Collision detected
+                            players[i].hp -= 1; // Decrease HP by 1
+                            unsigned char newRed = (players[i].cuboid.color.red <= 204) ? (players[i].cuboid.color.red + 51) : 255;
+                            unsigned char newGreen = (players[i].cuboid.color.green >= 51) ? (players[i].cuboid.color.green - 51) : 0;
+                            changePlayerColor(i, (Color){newRed, newGreen, 0});
+                            // Remove projectile
+                            proj->collided = 1;
+                            // Call collision callback if provided
+                            if (onCollision) {
+                                onCollision(index, i);
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -720,125 +736,125 @@ void setCameraRotation(double theta){
     playerCamera.yaw = theta;
 }
 
-int main() {
-    // char stdin_buffer[7 + HEIGHT * WIDTH * (21) + HEIGHT + 1 + 4];
-    // setvbuf(stdout, stdin_buffer, _IOFBF, 7 + HEIGHT * WIDTH * (21) + HEIGHT + 1 + 4);
+// int main() {
+//     // char stdin_buffer[7 + HEIGHT * WIDTH * (21) + HEIGHT + 1 + 4];
+//     // setvbuf(stdout, stdin_buffer, _IOFBF, 7 + HEIGHT * WIDTH * (21) + HEIGHT + 1 + 4);
 
-    // Disable buffer
-    setvbuf(stdout, NULL, _IONBF, 0);
+//     // Disable buffer
+//     setvbuf(stdout, NULL, _IONBF, 0);
     
-    // Hide cursor
-    write(STDOUT_FILENO, "\033[?25l", 6);
-    signal(SIGINT, ctrlcHandler);
+//     // Hide cursor
+//     write(STDOUT_FILENO, "\033[?25l", 6);
+//     signal(SIGINT, ctrlcHandler);
 
-    Cuboid cuboid = {
-        .position = {0.0, 0.0, 0.0},
-        .width = 2.0,
-        .height = 2.0,
-        .depth = 2.0,
-        .rotation_y = 0.0,
-        .color = {0, 255, 0}
-    };
+//     Cuboid cuboid = {
+//         .position = {0.0, 0.0, 0.0},
+//         .width = 2.0,
+//         .height = 2.0,
+//         .depth = 2.0,
+//         .rotation_y = 0.0,
+//         .color = {0, 255, 0}
+//     };
 
-    Gun gun = {
-        .position = {0.0, cuboid.position.y - cuboid.height / 4.0, 0.0},
-        .length = 4.0,
-        .rotation_y = 0.0,
-        .color = {255, 0, 0}
-    };
+//     Gun gun = {
+//         .position = {0.0, cuboid.position.y - cuboid.height / 4.0, 0.0},
+//         .length = 4.0,
+//         .rotation_y = 0.0,
+//         .color = {255, 0, 0}
+//     };
 
-    initProjectileQueue(&projectileQueue);
-    initPlayers(&players[0], 16);
+//     initProjectileQueue(&projectileQueue);
+//     initPlayers(&players[0], 16);
 
-    Player * player = &players[0];
+//     Player * player = &players[0];
 
-    Player * cameraPlayer = &players[1];
+//     Player * cameraPlayer = &players[1];
 
-    player->cuboid = cuboid;
-    player->gun = gun;
-    player->hp = 5;
+//     player->cuboid = cuboid;
+//     player->gun = gun;
+//     player->hp = 5;
 
-    cameraPlayer->cuboid = cuboid;
-    cameraPlayer->gun = gun;
-    cameraPlayer->hp = 5;
+//     cameraPlayer->cuboid = cuboid;
+//     cameraPlayer->gun = gun;
+//     cameraPlayer->hp = 5;
 
-    // Get current time
-    struct timespec next_frame, current, prev_frame;
-    clock_gettime(CLOCK_MONOTONIC, &next_frame);
-    prev_frame = next_frame;
+//     // Get current time
+//     struct timespec next_frame, current, prev_frame;
+//     clock_gettime(CLOCK_MONOTONIC, &next_frame);
+//     prev_frame = next_frame;
 
-    // First frame - clear screen once at start
-    write(STDOUT_FILENO, "\033[2J\033[H", 7);
-    clearScreen();
-    drawPlayer(*player);
-    drawPlayer(*cameraPlayer);
-    generateframeString();
-    render();
+//     // First frame - clear screen once at start
+//     write(STDOUT_FILENO, "\033[2J\033[H", 7);
+//     clearScreen();
+//     drawPlayer(*player);
+//     drawPlayer(*cameraPlayer);
+//     generateframeString();
+//     render();
 
-    short reden = 0;
-    short greenen = 1;
-    short blueen = 1;
+//     short reden = 0;
+//     short greenen = 1;
+//     short blueen = 1;
     
-    for (int i = 0; i < 10000; i++) {
+//     for (int i = 0; i < 10000; i++) {
 
-        if(i == 1500){
-            setActiveMSAA(1);
-        }
-        // Calculate next frame time
-        next_frame.tv_nsec += FRAME_INTERVAL_NS;
-        while (next_frame.tv_nsec >= 1000000000L) {
-            next_frame.tv_sec++;
-            next_frame.tv_nsec -= 1000000000L;
-        }
+//         if(i == 1500){
+//             setActiveMSAA(1);
+//         }
+//         // Calculate next frame time
+//         next_frame.tv_nsec += FRAME_INTERVAL_NS;
+//         while (next_frame.tv_nsec >= 1000000000L) {
+//             next_frame.tv_sec++;
+//             next_frame.tv_nsec -= 1000000000L;
+//         }
 
-        // Wait until the next frame time
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame, NULL);
+//         // Wait until the next frame time
+//         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame, NULL);
         
-        // Get current time and calculate delta time
-        clock_gettime(CLOCK_MONOTONIC, &current);
-        double delta_time = (current.tv_sec - prev_frame.tv_sec) + 
-                           (current.tv_nsec - prev_frame.tv_nsec) / 1000000000.0;
-        prev_frame = current;
-        clearScreen();
+//         // Get current time and calculate delta time
+//         clock_gettime(CLOCK_MONOTONIC, &current);
+//         double delta_time = (current.tv_sec - prev_frame.tv_sec) + 
+//                            (current.tv_nsec - prev_frame.tv_nsec) / 1000000000.0;
+//         prev_frame = current;
+//         clearScreen();
         
-        // Apply FPS-invariant movement and rotation
-        movePlayer(0, MOVE_SPEED * delta_time, 0.0, 0.0, 1);
-        //rotatePlayer(player, ROTATION_SPEED * delta_time);
+//         // Apply FPS-invariant movement and rotation
+//         movePlayer(0, MOVE_SPEED * delta_time, 0.0, 0.0, 1);
+//         //rotatePlayer(player, ROTATION_SPEED * delta_time);
 
-        moveCamera(
-            (Vec3){
-                player->cuboid.position.x + 15.0,
-                player->cuboid.position.y,
-                player->cuboid.position.z
-            }
-        );
-        setCameraRotation(-PI/2);
+//         moveCamera(
+//             (Vec3){
+//                 player->cuboid.position.x + 15.0,
+//                 player->cuboid.position.y,
+//                 player->cuboid.position.z
+//             }
+//         );
+//         setCameraRotation(-PI/2);
 
-        if(i % 1000 == 0 && i > 0){
-            shootProjectile(1, &projectileQueue);
-            //shootProjectile(0, &projectileQueue);
-        }
-        updateProjectiles(&projectileQueue, &players[0], 16, delta_time);
-        drawProjectiles(&projectileQueue);
-        drawPlayer(*player);
-        drawPlayer(*cameraPlayer);
-        generateframeString();
-        render();
-        // printf("Camera Player HP: %d\n", cameraPlayer->hp);
-        // printf("Enemy Player HP: %d Position:(%.2f, %.2f, %.2f) Rotation: %.2f\n", player->hp, player->cuboid.position.x, player->cuboid.position.y, player->cuboid.position.z, player->cuboid.rotation_y);
-        // printf("i: %d\n", i);
-        // printf("Projectile at index 0: Position(%.2f, %.2f, %.2f) Collided: %d\n",
-        //        projectileQueue.projectiles[0].position.x,
-        //        projectileQueue.projectiles[0].position.y,
-        //        projectileQueue.projectiles[0].position.z,
-        //        projectileQueue.projectiles[0].collided);
+//         if(i % 1000 == 0 && i > 0){
+//             shootProjectile(1, &projectileQueue);
+//             //shootProjectile(0, &projectileQueue);
+//         }
+//         updateProjectiles(&projectileQueue, &players[0], 16, delta_time);
+//         drawProjectiles(&projectileQueue);
+//         drawPlayer(*player);
+//         drawPlayer(*cameraPlayer);
+//         generateframeString();
+//         render();
+//         // printf("Camera Player HP: %d\n", cameraPlayer->hp);
+//         // printf("Enemy Player HP: %d Position:(%.2f, %.2f, %.2f) Rotation: %.2f\n", player->hp, player->cuboid.position.x, player->cuboid.position.y, player->cuboid.position.z, player->cuboid.rotation_y);
+//         // printf("i: %d\n", i);
+//         // printf("Projectile at index 0: Position(%.2f, %.2f, %.2f) Collided: %d\n",
+//         //        projectileQueue.projectiles[0].position.x,
+//         //        projectileQueue.projectiles[0].position.y,
+//         //        projectileQueue.projectiles[0].position.z,
+//         //        projectileQueue.projectiles[0].collided);
 
-        // if(hasCollided){
-        //     printf("Collided Cuboid info: %.2f, %.2f, %.2f, %.2f\n Collided Projectile info: %.2f, %.2f, %.2f, %.2f\n", collidedCuboid.position.x, collidedCuboid.position.y, collidedCuboid.position.z, collidedCuboid.rotation_y, collidedProjectile.position.x, collidedProjectile.position.y, collidedProjectile.position.z, collidedProjectile.rotation_y);
-        // } else {
-        //     printf("No collision detected this frame.\n\n");
-        // }
-    }
-    write(STDOUT_FILENO, "\033[?25h", 6); // Show cursor
-    return 0;
-}
+//         // if(hasCollided){
+//         //     printf("Collided Cuboid info: %.2f, %.2f, %.2f, %.2f\n Collided Projectile info: %.2f, %.2f, %.2f, %.2f\n", collidedCuboid.position.x, collidedCuboid.position.y, collidedCuboid.position.z, collidedCuboid.rotation_y, collidedProjectile.position.x, collidedProjectile.position.y, collidedProjectile.position.z, collidedProjectile.rotation_y);
+//         // } else {
+//         //     printf("No collision detected this frame.\n\n");
+//         // }
+//     }
+//     write(STDOUT_FILENO, "\033[?25h", 6); // Show cursor
+//     return 0;
+// }
