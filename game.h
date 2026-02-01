@@ -21,7 +21,7 @@
 #define FRAME_INTERVAL_NS (6060606L)  // 165 FPS
 
 // Movement and rotation speeds (per second)
-#define MOVE_SPEED 1.0  // 1 unit a second
+#define MOVE_SPEED 8.0  // 8 units a second
 #define ROTATION_SPEED 2.09439510239 //2 pi / 3 
 
 // Projectile config
@@ -116,13 +116,16 @@ void drawLineZ(Vec3 c0, Vec3 c1, int width, int height, Color lineColor, FrameBu
 void drawCuboid(const Cuboid cuboid);
 void drawGun(const Gun gun);
 void drawPlayer(const Player player);
+void drawAllPlayers();
 void movePlayer(short playerID, double forward, double right, double up, short globalCoordinates);
 void rotatePlayer(short playerID, double delta_yaw);
 void changePlayerColor(short playerID, Color newColor);
 void drawProjectiles(ProjectileQueue *queue);
 void printProjectiles(ProjectileQueue *queue);
 void shootProjectile(short playerID, ProjectileQueue *queue);
-void updateProjectiles(ProjectileQueue *queue, Player *players, short numPlayers, double deltaTime);
+// Collision callback: (projectile_index, hit_player_id)
+typedef void (*CollisionCallback)(short, short);
+void updateProjectiles(ProjectileQueue *queue, Player *players, short numPlayers, double deltaTime, short checkCollisions, CollisionCallback onCollision);
 void clearScreen();
 void generateframeString();
 void applyAA();
@@ -130,5 +133,94 @@ void render();
 void ctrlcHandler(int signum);
 void moveCamera(Vec3 newPosition);
 void setCameraRotation(double theta);
+
+// ============== NETWORK PROTOCOL ==============
+
+// Command codes
+#define CMD_MOVE_ROTATE     0   // Client -> Server: Move/rotate request
+#define CMD_SHOOT           1   // Client -> Server: Shoot request
+#define CMD_LOGIN           2   // Client -> Server: Login request
+#define CMD_MOVE_EXECUTED   3   // Server -> Client: Move command executed
+#define CMD_SHOOT_EXECUTED  4   // Server -> Client: Shoot command executed
+#define CMD_PROJECTILE_HIT  5   // Server -> Client: Projectile collision
+#define CMD_NEW_PLAYER      6   // Server -> Client: New player joined
+#define CMD_ONBOARDING      7   // Server -> Client: Full game state for new player
+#define CMD_LOGIN_DENIED    8   // Server -> Client: Server full
+#define CMD_PING            9   // Ping
+#define CMD_PONG            10  // Pong
+#define CMD_TERMINATE       11  // Terminate
+#define CMD_PLAYER_KILLED   12  // Server -> Client: Player disconnected/killed
+
+// Command payload structures (packed to ensure consistent sizes across platforms)
+#pragma pack(push, 1)
+
+// CMD_MOVE_ROTATE payload (Client -> Server)
+typedef struct {
+    double forward;             // Forward movement component
+    double right;               // Right movement component
+    double up;                  // Up movement component
+    short rotation_direction;   // 0=stop, 1=right, 2=left
+} CmdMoveRotate;
+
+// CMD_SHOOT payload - no additional data needed, just the command byte
+
+// CMD_LOGIN payload - no additional data needed, just the command byte
+
+// CMD_MOVE_EXECUTED payload (Server -> Client)
+typedef struct {
+    short playerID;
+    Vec3 position;
+    double rotation_y;
+    double forward;
+    double right;
+    double up;
+    short rotation_direction;
+} CmdMoveExecuted;
+
+// CMD_SHOOT_EXECUTED payload (Server -> Client)
+typedef struct {
+    short playerID;
+    Vec3 gun_position;
+    double gun_rotation_y;
+} CmdShootExecuted;
+
+// CMD_PROJECTILE_HIT payload (Server -> Client)
+typedef struct {
+    short projectile_index;
+    short hit_playerID;
+} CmdProjectileHit;
+
+// CMD_NEW_PLAYER payload (Server -> Client)
+typedef struct {
+    short playerID;
+    Player player;
+} CmdNewPlayer;
+
+// CMD_ONBOARDING payload (Server -> Client)
+typedef struct {
+    short assigned_playerID;
+    Player players[16];
+    ProjectileQueue projectileQueue;
+} CmdOnboarding;
+
+// CMD_LOGIN_DENIED - no additional data
+
+// CMD_PLAYER_KILLED payload (Server -> Client)
+typedef struct {
+    short playerID;
+} CmdPlayerKilled;
+
+#pragma pack(pop)
+
+// Player-subscriber mapping for O(1) lookup
+typedef struct {
+    short subscriber_index;     // Index in subscribers array (-1 if not connected)
+    short active;               // Whether this player slot is active
+    double last_shoot_time;     // Timestamp of last successful shoot (for 4s cooldown)
+    double forward;             // Current forward movement
+    double right;               // Current right movement  
+    double up;                  // Current up movement
+    short rotation_direction;   // Current rotation direction
+} PlayerConnection;
 
 #endif // GAME_H
