@@ -483,6 +483,14 @@ void receiver() {
         exit(1);
     }
 
+    // Allow IPv4-mapped IPv6 addresses (accept both IPv4 and IPv6 connections)
+    int no = 0;
+    if (setsockopt(server_sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)) < 0) {
+        perror("setsockopt IPV6_V6ONLY failed");
+        close(server_sockfd);
+        exit(1);
+    }
+
     // Bind to port 53847 (IPv6)
     server_addr.sin6_family = AF_INET6;
     server_addr.sin6_addr = in6addr_any;
@@ -509,6 +517,25 @@ void receiver() {
 
         unsigned char cmd_code = buffer[0];
 
+        // Log received command with IP (skip PONG and MOVE_ROTATE for less noise)
+        char ip_str[INET6_ADDRSTRLEN];
+        if (client_addr.sin6_family == AF_INET6) {
+            // Check if it's an IPv4-mapped IPv6 address
+            if (IN6_IS_ADDR_V4MAPPED(&client_addr.sin6_addr)) {
+                // Extract IPv4 address from IPv4-mapped IPv6
+                struct in_addr ipv4_addr;
+                memcpy(&ipv4_addr, &client_addr.sin6_addr.s6_addr[12], 4);
+                inet_ntop(AF_INET, &ipv4_addr, ip_str, sizeof(ip_str));
+            } else {
+                inet_ntop(AF_INET6, &client_addr.sin6_addr, ip_str, sizeof(ip_str));
+            }
+        } else {
+            snprintf(ip_str, sizeof(ip_str), "unknown");
+        }
+        printf("Received CMD %d from %s:%d (%d bytes)\n", 
+                cmd_code, ip_str, ntohs(client_addr.sin6_port), n);
+        fflush(stdout);
+        
         // Handle PING/PONG/TERMINATE immediately in receiver
         if (cmd_code == CMD_PONG) {
             enqueue_pong(&ping_queue, &client_addr, addr_len);
