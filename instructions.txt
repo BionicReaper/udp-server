@@ -1,0 +1,8 @@
+1. Add to %USERPROFILE%\.wslconfig:
+[wsl2]
+networkingMode=mirrored
+
+2. Firewall Rules:
+# Run as Administrator
+netsh advfirewall firewall add rule name="UDP Game Server" dir=in action=allow protocol=UDP localport=53847
+netsh advfirewall firewall add rule name="UDP Game Client" dir=out action=allow protocol=UDP localport=53847
