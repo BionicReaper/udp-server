@@ -12,6 +12,10 @@
 #define MAX_CMD_SIZE 256
 #define SHOOT_COOLDOWN 4.0  // 4 seconds between shots
 
+// Keep onboarding chunks below typical MTU to avoid IPv6/UDP fragmentation issues.
+// 1200 is conservative and generally safe across LAN/Wi-Fi.
+#define ONBOARDING_CHUNK_SIZE 1200
+
 typedef struct connection_info {
     struct sockaddr_in6 addr;
     socklen_t addr_len;
@@ -92,6 +96,45 @@ static int server_sockfd;  // Global socket for sending
 
 // Game timing
 static double game_time = 0.0;
+
+static void send_onboarding_chunked(const struct sockaddr_in6 *client_addr, socklen_t addr_len, short player_id) {
+    CmdOnboarding onboard;
+    onboard.assigned_playerID = player_id;
+    memcpy(onboard.players, players, sizeof(players));
+    memcpy(&onboard.projectileQueue, &projectileQueue, sizeof(projectileQueue));
+
+    const uint8_t *bytes = (const uint8_t *)&onboard;
+    const uint32_t total = (uint32_t)sizeof(onboard);
+
+    unsigned char begin_msg[1 + sizeof(CmdOnboardingBegin)];
+    begin_msg[0] = CMD_ONBOARDING_BEGIN;
+    CmdOnboardingBegin *begin = (CmdOnboardingBegin *)(begin_msg + 1);
+    begin->assigned_playerID = player_id;
+    begin->total_size = total;
+    begin->chunk_size = ONBOARDING_CHUNK_SIZE;
+    sendto(server_sockfd, begin_msg, sizeof(begin_msg), 0,
+        (struct sockaddr *)client_addr, addr_len);
+
+    uint32_t offset = 0;
+    while (offset < total) {
+     uint16_t len = (uint16_t)((total - offset > ONBOARDING_CHUNK_SIZE) ? ONBOARDING_CHUNK_SIZE : (total - offset));
+     unsigned char chunk_msg[1 + sizeof(CmdOnboardingChunkHeader) + ONBOARDING_CHUNK_SIZE];
+     chunk_msg[0] = CMD_ONBOARDING_CHUNK;
+     CmdOnboardingChunkHeader *hdr = (CmdOnboardingChunkHeader *)(chunk_msg + 1);
+     hdr->offset = offset;
+     hdr->data_len = len;
+     memcpy(chunk_msg + 1 + sizeof(CmdOnboardingChunkHeader), bytes + offset, len);
+     sendto(server_sockfd, chunk_msg, 1 + sizeof(CmdOnboardingChunkHeader) + len, 0,
+         (struct sockaddr *)client_addr, addr_len);
+     offset += len;
+    }
+
+    // Optional end marker (not strictly required, client can complete on total bytes)
+    unsigned char end_msg[1];
+    end_msg[0] = CMD_ONBOARDING_END;
+    sendto(server_sockfd, end_msg, sizeof(end_msg), 0,
+        (struct sockaddr *)client_addr, addr_len);
+}
 
 void swap_queues() {
     /* Swap receiver/consumer queues */
@@ -279,15 +322,8 @@ void handle_login(const struct sockaddr_in6 *client_addr, socklen_t addr_len) {
     if (subscriber_idx >= 0) {
         short player_id = find_player_by_subscriber(subscriber_idx);
         if (player_id >= 0) {
-            // Already logged in, resend onboarding
-            unsigned char response[1 + sizeof(CmdOnboarding)];
-            response[0] = CMD_ONBOARDING;
-            CmdOnboarding *onboard = (CmdOnboarding*)(response + 1);
-            onboard->assigned_playerID = player_id;
-            memcpy(onboard->players, players, sizeof(players));
-            memcpy(&onboard->projectileQueue, &projectileQueue, sizeof(projectileQueue));
-            sendto(server_sockfd, response, sizeof(response), 0,
-                   (struct sockaddr*)client_addr, addr_len);
+            // Already logged in, resend onboarding (chunked)
+            send_onboarding_chunked(client_addr, addr_len, player_id);
             return;
         }
     }
@@ -363,15 +399,8 @@ void handle_login(const struct sockaddr_in6 *client_addr, socklen_t addr_len) {
     printf("Player %d logged in (subscriber %d)\n", player_id, subscriber_idx);
     fflush(stdout);
     
-    // Send onboarding to new player
-    unsigned char response[1 + sizeof(CmdOnboarding)];
-    response[0] = CMD_ONBOARDING;
-    CmdOnboarding *onboard = (CmdOnboarding*)(response + 1);
-    onboard->assigned_playerID = player_id;
-    memcpy(onboard->players, players, sizeof(players));
-    memcpy(&onboard->projectileQueue, &projectileQueue, sizeof(projectileQueue));
-    sendto(server_sockfd, response, sizeof(response), 0,
-           (struct sockaddr*)client_addr, addr_len);
+    // Send onboarding to new player (chunked)
+    send_onboarding_chunked(client_addr, addr_len, player_id);
     
     // Broadcast new player to others
     unsigned char broadcast[1 + sizeof(CmdNewPlayer)];

@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <limits.h>
+#include <stdint.h>
 
 // Constants
 #define WIDTH 400
@@ -150,6 +151,10 @@ void setCameraRotation(double theta);
 #define CMD_PONG            10  // Pong
 #define CMD_TERMINATE       11  // Terminate
 #define CMD_PLAYER_KILLED   12  // Server -> Client: Player disconnected/killed
+// Chunked onboarding (avoids large single UDP datagrams / fragmentation issues)
+#define CMD_ONBOARDING_BEGIN 13 // Server -> Client: Start chunked onboarding
+#define CMD_ONBOARDING_CHUNK 14 // Server -> Client: Chunk of onboarding payload
+#define CMD_ONBOARDING_END   15 // Server -> Client: End chunked onboarding (optional)
 
 // Command payload structures (packed to ensure consistent sizes across platforms)
 #pragma pack(push, 1)
@@ -209,6 +214,22 @@ typedef struct {
 typedef struct {
     short playerID;
 } CmdPlayerKilled;
+
+// CMD_ONBOARDING_BEGIN payload (Server -> Client)
+// total_size is the number of bytes of the CmdOnboarding payload (no command byte).
+// chunk_size is the max chunk payload size used by the server.
+typedef struct {
+    short assigned_playerID;
+    uint32_t total_size;
+    uint16_t chunk_size;
+} CmdOnboardingBegin;
+
+// CMD_ONBOARDING_CHUNK payload header (Server -> Client)
+// Followed by data_len bytes.
+typedef struct {
+    uint32_t offset;
+    uint16_t data_len;
+} CmdOnboardingChunkHeader;
 
 #pragma pack(pop)
 

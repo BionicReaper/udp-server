@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <sys/select.h>
+#include <stdint.h>
 #include "game.h"
 
 #define MAX_CMD_SIZE 8192
@@ -21,6 +22,14 @@ static short my_player_id = -1;
 static int connected = 0;
 static int receiver_terminated = 0;
 static int game_running = 0;
+
+// Chunked onboarding reassembly (avoids relying on UDP/IP fragmentation)
+static unsigned char onboarding_buf[sizeof(CmdOnboarding)];
+static uint32_t onboarding_total = 0;
+static uint16_t onboarding_chunk_size = 0;
+static int onboarding_chunks_expected = 0;
+static unsigned char onboarding_chunks_received[64];
+static int onboarding_in_progress = 0;
 
 // Input state tracking
 static short key_w = 0, key_a = 0, key_s = 0, key_d = 0;
@@ -42,6 +51,8 @@ LocalPlayerMovement localMovement[16];
 
 // Mutexes for thread safety
 static pthread_mutex_t game_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void handle_onboarding(const unsigned char *data, int length);
 
 void restore_terminal() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
@@ -69,8 +80,79 @@ void send_command(unsigned char cmd_code, void *payload, int payload_size) {
            (struct sockaddr*)&server_addr, sizeof(server_addr));
 }
 
+static void onboarding_reset(void) {
+    onboarding_total = 0;
+    onboarding_chunk_size = 0;
+    onboarding_chunks_expected = 0;
+    memset(onboarding_chunks_received, 0, sizeof(onboarding_chunks_received));
+    onboarding_in_progress = 0;
+}
+
+static void handle_onboarding_begin(const unsigned char *data, int length) {
+    if (length < (int)sizeof(CmdOnboardingBegin)) return;
+    const CmdOnboardingBegin *begin = (const CmdOnboardingBegin *)data;
+
+    if (begin->total_size == 0 || begin->total_size > sizeof(CmdOnboarding)) {
+        onboarding_reset();
+        return;
+    }
+    if (begin->chunk_size == 0 || begin->chunk_size > 4096) {
+        onboarding_reset();
+        return;
+    }
+
+    onboarding_total = begin->total_size;
+    onboarding_chunk_size = begin->chunk_size;
+    onboarding_chunks_expected = (int)((onboarding_total + onboarding_chunk_size - 1) / onboarding_chunk_size);
+    if (onboarding_chunks_expected <= 0 || onboarding_chunks_expected > (int)sizeof(onboarding_chunks_received)) {
+        onboarding_reset();
+        return;
+    }
+
+    memset(onboarding_buf, 0, sizeof(onboarding_buf));
+    memset(onboarding_chunks_received, 0, sizeof(onboarding_chunks_received));
+    onboarding_in_progress = 1;
+}
+
+static void try_finish_onboarding(void) {
+    if (!onboarding_in_progress) return;
+    if (onboarding_total == 0 || onboarding_chunks_expected <= 0) return;
+
+    for (int i = 0; i < onboarding_chunks_expected; i++) {
+        if (!onboarding_chunks_received[i]) return;
+    }
+
+    // We have a full CmdOnboarding payload; reuse existing handler.
+    handle_onboarding(onboarding_buf, (int)onboarding_total);
+    connected = 1;
+    onboarding_in_progress = 0;
+}
+
+static void handle_onboarding_chunk(const unsigned char *data, int length) {
+    if (!onboarding_in_progress) return;
+    if (length < (int)sizeof(CmdOnboardingChunkHeader)) return;
+
+    const CmdOnboardingChunkHeader *hdr = (const CmdOnboardingChunkHeader *)data;
+    const unsigned char *chunk_data = data + sizeof(CmdOnboardingChunkHeader);
+    int chunk_len = length - (int)sizeof(CmdOnboardingChunkHeader);
+
+    if ((int)hdr->data_len != chunk_len) return;
+    if (hdr->offset >= onboarding_total) return;
+    if (hdr->data_len == 0) return;
+    if (hdr->offset + hdr->data_len > onboarding_total) return;
+
+    memcpy(onboarding_buf + hdr->offset, chunk_data, hdr->data_len);
+
+    int chunk_index = (int)(hdr->offset / onboarding_chunk_size);
+    if (chunk_index >= 0 && chunk_index < (int)sizeof(onboarding_chunks_received)) {
+        onboarding_chunks_received[chunk_index] = 1;
+    }
+
+    try_finish_onboarding();
+}
+
 // Handle CMD_ONBOARDING
-void handle_onboarding(const unsigned char *data, int length) {
+static void handle_onboarding(const unsigned char *data, int length) {
     if (length < sizeof(CmdOnboarding)) return;
     
     CmdOnboarding *onboard = (CmdOnboarding*)data;
@@ -233,6 +315,19 @@ void *receiver_thread(void *arg) {
                 
             case CMD_ONBOARDING:
                 handle_onboarding(payload, payload_len);
+                break;
+
+            case CMD_ONBOARDING_BEGIN:
+                handle_onboarding_begin(payload, payload_len);
+                break;
+
+            case CMD_ONBOARDING_CHUNK:
+                handle_onboarding_chunk(payload, payload_len);
+                break;
+
+            case CMD_ONBOARDING_END:
+                // Optional marker; attempt completion in case final chunk arrived earlier.
+                try_finish_onboarding();
                 break;
                 
             case CMD_MOVE_EXECUTED:
@@ -401,6 +496,8 @@ int main(int argc, char *argv[]) {
     printf("Connecting to server...\n");
     fflush(stdout);
 
+    onboarding_reset();
+
     // Try to login
     for (int attempt = 0; attempt < 12 && !connected; attempt++) {
         printf("\rAttempt %02d: Sending LOGIN...", attempt + 1);
@@ -415,11 +512,24 @@ int main(int argc, char *argv[]) {
         int n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
                          (struct sockaddr*)&from_addr, &from_len);
         if (n > 0) {
-            if (buffer[0] == CMD_ONBOARDING) {
+            unsigned char code = buffer[0];
+            if (code == CMD_ONBOARDING) {
                 handle_onboarding(buffer + 1, n - 1);
                 connected = 1;
                 printf(" Connected!\n");
-            } else if (buffer[0] == CMD_LOGIN_DENIED) {
+            } else if (code == CMD_ONBOARDING_BEGIN) {
+                handle_onboarding_begin(buffer + 1, n - 1);
+            } else if (code == CMD_ONBOARDING_CHUNK) {
+                handle_onboarding_chunk(buffer + 1, n - 1);
+                if (connected) {
+                    printf(" Connected!\n");
+                }
+            } else if (code == CMD_ONBOARDING_END) {
+                try_finish_onboarding();
+                if (connected) {
+                    printf(" Connected!\n");
+                }
+            } else if (code == CMD_LOGIN_DENIED) {
                 handle_login_denied();
             }
         }
