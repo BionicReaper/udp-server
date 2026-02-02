@@ -8,11 +8,35 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <errno.h>
+#include <signal.h>
 #include "game.h"
+
+// Try to include evdev support
+#ifdef __linux__
+#include <linux/input.h>
+#endif
 
 #define MAX_CMD_SIZE 8192
 #define FRAME_INTERVAL_NS_CLIENT (16666667L)  // 60 FPS
+#define INPUT_SERVER_PORT 53850
+
+// Input method enumeration
+typedef enum {
+    INPUT_METHOD_NONE,
+    INPUT_METHOD_EVDEV,
+    INPUT_METHOD_NETWORK,
+    INPUT_METHOD_TERMINAL
+} InputMethod;
+
+static InputMethod current_input_method = INPUT_METHOD_NONE;
+static int evdev_fd = -1;
+static int input_server_fd = -1;
+static pthread_t input_thread;
 
 // Client state
 static int sockfd;
@@ -34,10 +58,13 @@ static int onboarding_in_progress = 0;
 // Input state tracking
 static short key_w = 0, key_a = 0, key_s = 0, key_d = 0;
 static short key_left = 0, key_right = 0;
+static short key_space = 0, key_space_prev = 0;
 static short prev_moving = 0;
 static short prev_rotating = 0;
 static double prev_forward = 0, prev_right = 0, prev_up = 0;
 static short prev_rot_dir = 0;
+static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int input_thread_running = 0;
 
 // Player movement state (for local simulation)
 typedef struct {
@@ -52,11 +79,54 @@ LocalPlayerMovement localMovement[16];
 // Mutexes for thread safety
 static pthread_mutex_t game_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Cleanup state tracking
+static volatile sig_atomic_t cleanup_done = 0;
+static volatile sig_atomic_t terminal_initialized = 0;
+
 static void handle_onboarding(const unsigned char *data, int length);
 
+// Forward declarations for cleanup
+static void cleanup_input_system(void);
+
+// Cleanup function registered with atexit - always runs on exit
+static void cleanup_all(void) {
+    if (cleanup_done) return;
+    cleanup_done = 1;
+    
+    // Stop threads first
+    input_thread_running = 0;
+    receiver_terminated = 1;
+    game_running = 0;
+    
+    // Close input system (this will signal threads to stop)
+    if (current_input_method == INPUT_METHOD_EVDEV && evdev_fd >= 0) {
+        close(evdev_fd);
+        evdev_fd = -1;
+    }
+    if (current_input_method == INPUT_METHOD_NETWORK && input_server_fd >= 0) {
+        close(input_server_fd);
+        input_server_fd = -1;
+    }
+    
+    // Close game socket
+    if (sockfd >= 0) {
+        close(sockfd);
+        sockfd = -1;
+    }
+    
+    // Restore terminal (only if we modified it)
+    if (terminal_initialized) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        write(STDOUT_FILENO, "\033[?25h", 6);  // Show cursor
+        write(STDOUT_FILENO, "\n", 1);
+    }
+}
+
 void restore_terminal() {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-    write(STDOUT_FILENO, "\033[?25h", 6);  // Show cursor
+    if (terminal_initialized) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        write(STDOUT_FILENO, "\033[?25h", 6);  // Show cursor
+    }
 }
 
 void set_raw_mode() {
@@ -67,7 +137,296 @@ void set_raw_mode() {
     raw.c_cc[VMIN] = 0;   // Non-blocking read
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    terminal_initialized = 1;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
+
+// ============================================================================
+// EVDEV INPUT SUPPORT
+// ============================================================================
+
+#ifdef __linux__
+// Map evdev keycodes to our internal key states
+static void handle_evdev_event(int code, int value) {
+    // value: 0 = release, 1 = press, 2 = repeat (we treat repeat as held)
+    short state = (value != 0) ? 1 : 0;
+    
+    pthread_mutex_lock(&input_mutex);
+    switch (code) {
+        case KEY_W:
+            key_w = state;
+            break;
+        case KEY_A:
+            key_a = state;
+            break;
+        case KEY_S:
+            key_s = state;
+            break;
+        case KEY_D:
+            key_d = state;
+            break;
+        case KEY_LEFT:
+            key_left = state;
+            break;
+        case KEY_RIGHT:
+            key_right = state;
+            break;
+        case KEY_SPACE:
+            key_space = state;
+            break;
+        case KEY_UP:
+            key_w = state;
+            break;
+        case KEY_DOWN:
+            key_s = state;
+            break;
+    }
+    pthread_mutex_unlock(&input_mutex);
+}
+
+// Thread function for evdev input
+static void *evdev_input_thread(void *arg) {
+    (void)arg;
+    struct input_event ev;
+    
+    while (input_thread_running && evdev_fd >= 0) {
+        ssize_t n = read(evdev_fd, &ev, sizeof(ev));
+        if (n == sizeof(ev)) {
+            if (ev.type == EV_KEY) {
+                handle_evdev_event(ev.code, ev.value);
+            }
+        } else if (n < 0 && errno != EAGAIN) {
+            break;
+        }
+        usleep(1000); // Small sleep to prevent busy loop
+    }
+    return NULL;
+}
+
+// Try to find and open a keyboard evdev device
+static int try_evdev_init(void) {
+    DIR *dir = opendir("/dev/input");
+    if (!dir) return 0;
+    
+    struct dirent *entry;
+    char path[512];
+    int found = 0;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "event", 5) != 0) continue;
+        
+        snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+        
+        // Check if this device has keyboard capabilities
+        unsigned long evbit[((EV_MAX + 7) / 8 + sizeof(unsigned long) - 1) / sizeof(unsigned long)] = {0};
+        unsigned long keybit[((KEY_MAX + 7) / 8 + sizeof(unsigned long) - 1) / sizeof(unsigned long)] = {0};
+        
+        if (ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), evbit) >= 0 &&
+            (evbit[0] & (1UL << EV_KEY)) &&
+            ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit) >= 0) {
+            
+            // Check for W, A, S, D keys
+            if ((keybit[KEY_W / (8 * sizeof(unsigned long))] & (1UL << (KEY_W % (8 * sizeof(unsigned long))))) &&
+                (keybit[KEY_A / (8 * sizeof(unsigned long))] & (1UL << (KEY_A % (8 * sizeof(unsigned long))))) &&
+                (keybit[KEY_S / (8 * sizeof(unsigned long))] & (1UL << (KEY_S % (8 * sizeof(unsigned long))))) &&
+                (keybit[KEY_D / (8 * sizeof(unsigned long))] & (1UL << (KEY_D % (8 * sizeof(unsigned long)))))) {
+                evdev_fd = fd;
+                found = 1;
+                break;
+            }
+        }
+        close(fd);
+    }
+    closedir(dir);
+    
+    if (found) {
+        input_thread_running = 1;
+        if (pthread_create(&input_thread, NULL, evdev_input_thread, NULL) != 0) {
+            close(evdev_fd);
+            evdev_fd = -1;
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+#else
+static int try_evdev_init(void) { return 0; }
+#endif
+
+// ============================================================================
+// NETWORK INPUT SERVER SUPPORT (for WSL/Windows)
+// ============================================================================
+
+// Protocol: each message is 2 bytes: [keycode][state]
+// keycode: 'W', 'A', 'S', 'D', 'L' (left), 'R' (right), ' ' (space)
+// state: 0 = release, 1 = press
+
+static void handle_network_input(unsigned char keycode, unsigned char state) {
+    short key_state = (state != 0) ? 1 : 0;
+    
+    pthread_mutex_lock(&input_mutex);
+    switch (keycode) {
+        case 'W': case 'w':
+            key_w = key_state;
+            break;
+        case 'A': case 'a':
+            key_a = key_state;
+            break;
+        case 'S': case 's':
+            key_s = key_state;
+            break;
+        case 'D': case 'd':
+            key_d = key_state;
+            break;
+        case 'L': case 'l': // Left arrow
+            key_left = key_state;
+            break;
+        case 'R': case 'r': // Right arrow
+            key_right = key_state;
+            break;
+        case ' ': // Space
+            key_space = key_state;
+            break;
+        case 'U': case 'u': // Up arrow (mapped to W)
+            key_w = key_state;
+            break;
+        case 'N': case 'n': // Down arrow (mapped to S)
+            key_s = key_state;
+            break;
+    }
+    pthread_mutex_unlock(&input_mutex);
+}
+
+// Thread function for network input
+static void *network_input_thread(void *arg) {
+    (void)arg;
+    unsigned char buffer[2];
+    
+    while (input_thread_running && input_server_fd >= 0) {
+        ssize_t n = recv(input_server_fd, buffer, 2, 0);
+        if (n == 2) {
+            handle_network_input(buffer[0], buffer[1]);
+        } else if (n <= 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                break; // Connection closed or error
+            }
+        }
+        usleep(1000); // Small sleep to prevent busy loop
+    }
+    return NULL;
+}
+
+// Try to connect to the input server
+static int try_network_input_init(void) {
+    struct sockaddr_in addr;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(INPUT_SERVER_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    
+    // Set a short timeout for connection attempt
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return 0;
+    }
+    
+    // Set non-blocking after connection
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    
+    input_server_fd = fd;
+    input_thread_running = 1;
+    
+    if (pthread_create(&input_thread, NULL, network_input_thread, NULL) != 0) {
+        close(input_server_fd);
+        input_server_fd = -1;
+        return 0;
+    }
+    
+    return 1;
+}
+
+// ============================================================================
+// INPUT SYSTEM INITIALIZATION
+// ============================================================================
+
+static void init_input_system(void) {
+    // Try evdev first (native Linux with proper permissions)
+#ifdef __linux__
+    if (try_evdev_init()) {
+        current_input_method = INPUT_METHOD_EVDEV;
+        printf("Input: Using evdev (direct keyboard access)\n");
+        return;
+    }
+#endif
+    
+    // Try network input server (for WSL/Windows)
+    if (try_network_input_init()) {
+        current_input_method = INPUT_METHOD_NETWORK;
+        printf("Input: Using network input server (port %d)\n", INPUT_SERVER_PORT);
+        return;
+    }
+    
+    // Fall back to terminal input
+    current_input_method = INPUT_METHOD_TERMINAL;
+    printf("Input: Using terminal (may have repeat delay)\n");
+}
+
+static void cleanup_input_system(void) {
+    input_thread_running = 0;
+    
+    if (current_input_method == INPUT_METHOD_EVDEV && evdev_fd >= 0) {
+        close(evdev_fd);
+        evdev_fd = -1;
+        pthread_join(input_thread, NULL);
+    }
+    
+    if (current_input_method == INPUT_METHOD_NETWORK && input_server_fd >= 0) {
+        close(input_server_fd);
+        input_server_fd = -1;
+        pthread_join(input_thread, NULL);
+    }
+}
+
+// Signal handler for clean exit on Ctrl+C
+static void sigint_handler(int sig) {
+    (void)sig;
+    // Set flags to stop all loops
+    receiver_terminated = 1;
+    game_running = 0;
+    input_thread_running = 0;
+    
+    // Close file descriptors to unblock any threads waiting on I/O
+    if (evdev_fd >= 0) {
+        close(evdev_fd);
+        evdev_fd = -1;
+    }
+    if (input_server_fd >= 0) {
+        close(input_server_fd);
+        input_server_fd = -1;
+    }
+    
+    // Note: cleanup_all() will be called by atexit() when we exit
+    // Using _exit() would skip atexit handlers, so we just return
+    // and let the main loop detect the flags and exit normally.
+    // If the main loop is stuck, a second Ctrl+C will terminate forcefully.
+}
+
+// ============================================================================
+// END INPUT SYSTEM
+// ============================================================================
 
 // Send a command to the server
 void send_command(unsigned char cmd_code, void *payload, int payload_size) {
@@ -276,9 +635,7 @@ void handle_player_killed(const unsigned char *data, int length) {
 void handle_login_denied() {
     printf("Server is full. Cannot join.\n");
     fflush(stdout);
-    restore_terminal();
-    close(sockfd);
-    exit(1);
+    exit(1);  // atexit(cleanup_all) handles cleanup
 }
 
 void *receiver_thread(void *arg) {
@@ -308,9 +665,7 @@ void *receiver_thread(void *arg) {
             case CMD_TERMINATE:
                 printf("\n\nServer sent TERMINATE. Exiting.\n");
                 receiver_terminated = 1;
-                restore_terminal();
-                close(sockfd);
-                exit(0);
+                exit(0);  // atexit(cleanup_all) handles cleanup
                 break;
                 
             case CMD_ONBOARDING:
@@ -367,10 +722,18 @@ void get_movement_direction(double *forward, double *right, double *up) {
     *right = 0;
     *up = 0;
     
+    if (current_input_method != INPUT_METHOD_TERMINAL) {
+        pthread_mutex_lock(&input_mutex);
+    }
+    
     if (key_w) *forward += 1.0;
     if (key_s) *forward -= 1.0;
     if (key_d) *right += 1.0;
     if (key_a) *right -= 1.0;
+    
+    if (current_input_method != INPUT_METHOD_TERMINAL) {
+        pthread_mutex_unlock(&input_mutex);
+    }
     
     // Normalize if moving diagonally
     if (*forward != 0 && *right != 0) {
@@ -382,13 +745,45 @@ void get_movement_direction(double *forward, double *right, double *up) {
 
 // Get rotation direction from arrow keys
 short get_rotation_direction() {
-    if (key_right && !key_left) return 1;  // Right
-    if (key_left && !key_right) return 2;  // Left
-    return 0;  // Stop
+    short result = 0;
+    
+    if (current_input_method != INPUT_METHOD_TERMINAL) {
+        pthread_mutex_lock(&input_mutex);
+    }
+    
+    if (key_right && !key_left) result = 1;  // Right
+    else if (key_left && !key_right) result = 2;  // Left
+    
+    if (current_input_method != INPUT_METHOD_TERMINAL) {
+        pthread_mutex_unlock(&input_mutex);
+    }
+    
+    return result;
 }
 
-// Process keyboard input
-void process_input() {
+// Check if space key was just pressed (for shooting)
+short check_shoot() {
+    short should_shoot = 0;
+    
+    if (current_input_method != INPUT_METHOD_TERMINAL) {
+        pthread_mutex_lock(&input_mutex);
+    }
+    
+    // Shoot on key press (transition from not pressed to pressed)
+    if (key_space && !key_space_prev) {
+        should_shoot = 1;
+    }
+    key_space_prev = key_space;
+    
+    if (current_input_method != INPUT_METHOD_TERMINAL) {
+        pthread_mutex_unlock(&input_mutex);
+    }
+    
+    return should_shoot;
+}
+
+// Process keyboard input (terminal fallback mode only)
+void process_input_terminal() {
     char c;
     char escape_seq[3] = {0};
     
@@ -427,33 +822,45 @@ void process_input() {
                     key_d = 1;
                     break;
                 case ' ':  // Spacebar - shoot
-                    send_command(CMD_SHOOT, NULL, 0);
+                    key_space = 1;
                     break;
                 case 3:  // Ctrl+C
-                    receiver_terminated = 1;
-                    restore_terminal();
-                    close(sockfd);
                     printf("\nExiting...\n");
-                    exit(0);
+                    exit(0);  // atexit(cleanup_all) handles cleanup
                     break;
             }
         }
     }
 }
 
-// Check if a key is still being pressed (simplified - we reset after each frame)
+// Process input based on current input method
+void process_input() {
+    if (current_input_method == INPUT_METHOD_TERMINAL) {
+        process_input_terminal();
+    }
+    // For EVDEV and NETWORK methods, input is handled by their respective threads
+    // We just need to lock when reading the key states (done in get_movement_direction)
+}
+
+// Reset key states (only for terminal fallback mode)
 void reset_key_states() {
-    key_w = 0;
-    key_a = 0;
-    key_s = 0;
-    key_d = 0;
-    key_left = 0;
-    key_right = 0;
+    if (current_input_method == INPUT_METHOD_TERMINAL) {
+        key_w = 0;
+        key_a = 0;
+        key_s = 0;
+        key_d = 0;
+        key_left = 0;
+        key_right = 0;
+        key_space = 0;
+    }
 }
 
 int main(int argc, char *argv[]) {
     char server_ip[256];
     int use_msaa = 1;  // Default to MSAA on
+    
+    // Register cleanup handler - runs on any exit
+    atexit(cleanup_all);
     
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -561,6 +968,12 @@ int main(int argc, char *argv[]) {
     // Set terminal to raw mode (no echo, no line buffering)
     set_raw_mode();
     
+    // Install signal handler for clean exit
+    signal(SIGINT, sigint_handler);
+    
+    // Initialize input system (tries evdev, then network, then terminal fallback)
+    init_input_system();
+    
     // Hide cursor
     write(STDOUT_FILENO, "\033[?25l", 6);
     
@@ -591,6 +1004,11 @@ int main(int argc, char *argv[]) {
 
         // Process input
         process_input();
+
+        // Check for shooting
+        if (check_shoot()) {
+            send_command(CMD_SHOOT, NULL, 0);
+        }
 
         // Calculate current movement state
         double forward, right, up;
@@ -674,11 +1092,7 @@ int main(int argc, char *argv[]) {
         pthread_mutex_unlock(&game_mutex);
     }
 
-    // Cleanup
-    restore_terminal();
-    close(sockfd);
-    pthread_join(recv_thread, NULL);
-    
+    // Note: atexit(cleanup_all) handles all cleanup automatically
     printf("\nClient terminated.\n");
     return 0;
 }
