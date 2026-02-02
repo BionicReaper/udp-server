@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <signal.h>
+#include <math.h>
 #include "game.h"
 
 // Try to include evdev support
@@ -1015,13 +1016,21 @@ int main(int argc, char *argv[]) {
         get_movement_direction(&forward, &right, &up);
         short rot_dir = get_rotation_direction();
 
-        // Check if movement state changed
+        // Check if movement state changed (use epsilon for float comparison to avoid precision issues)
+        const double EPSILON = 0.0001;
         short moving = (forward != 0 || right != 0 || up != 0);
         short rotating = (rot_dir != 0);
+        
+        int forward_changed = (fabs(forward - prev_forward) > EPSILON);
+        if(forward_changed)
+        printf("Forward: %.f (prev: %.f)\n", forward, prev_forward);
+        int right_changed = (fabs(right - prev_right) > EPSILON);
+        int up_changed = (fabs(up - prev_up) > EPSILON);
+        int rot_changed = (rot_dir != prev_rot_dir);
+        int stop_moving = (prev_moving && !moving);
+        int stop_rotating = (prev_rotating && !rotating);
 
-        if (forward != prev_forward || right != prev_right || up != prev_up || 
-            rot_dir != prev_rot_dir || 
-            (prev_moving && !moving) || (prev_rotating && !rotating)) {
+        if (forward_changed || right_changed || up_changed || rot_changed || stop_moving || stop_rotating) {
             // Send move command
             CmdMoveRotate cmd;
             cmd.forward = forward;
