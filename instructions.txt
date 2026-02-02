@@ -4,8 +4,13 @@ networkingMode=mirrored
 
 2. Firewall Rules:
 # Run as Administrator
+# For local network only:
 netsh advfirewall firewall add rule name="UDP Game Server" dir=in action=allow protocol=UDP localport=53847 remoteip=192.168.0.0/16
-netsh advfirewall firewall add rule name="UDP Game Client" dir=out action=allow protocol=UDP localport=53847 remoteip=192.168.0.0/16,specific
+netsh advfirewall firewall add rule name="UDP Game Client" dir=out action=allow protocol=UDP localport=53847 remoteip=192.168.0.0/16
+
+# For ALL IPs (internet):
+netsh advfirewall firewall add rule name="UDP Game Server" dir=in action=allow protocol=UDP localport=53847
+netsh advfirewall firewall add rule name="UDP Game Client" dir=out action=allow protocol=UDP localport=53847
 
 3. To remove:
 netsh advfirewall firewall delete rule name="UDP Game Server"
