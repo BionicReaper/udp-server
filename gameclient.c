@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <termios.h>
 #include <pthread.h>
 #include <sys/time.h>
@@ -15,6 +16,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <math.h>
+#include <netdb.h>
 #include "game.h"
 
 // Try to include evdev support
@@ -25,6 +27,124 @@
 #define MAX_CMD_SIZE 8192
 #define FRAME_INTERVAL_NS_CLIENT (16666667L)  // 60 FPS
 #define INPUT_SERVER_PORT 53850
+
+#define STUN_SERVER_ADDRESS "stun.l.google.com"
+#define STUN_SERVER_PORT 19302
+
+// Query STUN server to discover public IP:port (returns 1 on success, 0 on failure)
+static int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *public_ip, int ip_size, int *public_port) {
+    // Build STUN Binding Request
+    uint8_t request[20];
+    uint16_t msg_type = htons(0x0001);
+    uint16_t msg_len = htons(0);
+    uint32_t magic_cookie = htonl(0x2112A442);
+    uint8_t transaction_id[12];
+    for (int i = 0; i < 12; i++) transaction_id[i] = rand() & 0xFF;
+    
+    memcpy(request, &msg_type, 2);
+    memcpy(request + 2, &msg_len, 2);
+    memcpy(request + 4, &magic_cookie, 4);
+    memcpy(request + 8, transaction_id, 12);
+    
+    // Resolve STUN server
+    struct addrinfo hints, *res, *rp;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_DGRAM;
+    
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", stun_port);
+    
+    if (getaddrinfo(stun_host, port_str, &hints, &res) != 0) {
+        return 0;
+    }
+    
+    // Send request to first available address
+    int sent = 0;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        if (rp->ai_family == AF_INET) {
+            struct sockaddr_in *sin4 = (struct sockaddr_in *)rp->ai_addr;
+            struct sockaddr_in6 sin6;
+            memset(&sin6, 0, sizeof(sin6));
+            sin6.sin6_family = AF_INET6;
+            sin6.sin6_port = sin4->sin_port;
+            sin6.sin6_addr.s6_addr[10] = 0xff;
+            sin6.sin6_addr.s6_addr[11] = 0xff;
+            memcpy(&sin6.sin6_addr.s6_addr[12], &sin4->sin_addr, 4);
+            if (sendto(sockfd, request, sizeof(request), 0, (struct sockaddr *)&sin6, sizeof(sin6)) >= 0) {
+                sent = 1;
+                break;
+            }
+        } else if (rp->ai_family == AF_INET6) {
+            if (sendto(sockfd, request, sizeof(request), 0, rp->ai_addr, rp->ai_addrlen) >= 0) {
+                sent = 1;
+                break;
+            }
+        }
+    }
+    
+    freeaddrinfo(res);
+    if (!sent) return 0;
+    
+    // Save original socket timeout
+    struct timeval tv_orig;
+    socklen_t tv_len = sizeof(tv_orig);
+    getsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, &tv_len);
+    
+    // Set receive timeout for STUN query
+    struct timeval tv;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    uint8_t buffer[2048];
+    struct sockaddr_in6 from;
+    socklen_t fromlen = sizeof(from);
+    ssize_t n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &fromlen);
+    
+    // Restore original socket timeout
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, sizeof(tv_orig));
+    
+    if (n < 20) return 0;
+    
+    // Parse STUN response
+    uint32_t resp_cookie = ntohl(*(uint32_t *)(buffer + 4));
+    if (resp_cookie != 0x2112A442) return 0;
+    
+    uint16_t resp_len = ntohs(*(uint16_t *)(buffer + 2));
+    int offset = 20;
+    while (offset + 4 <= n && offset < 20 + resp_len) {
+        uint16_t attr_type = ntohs(*(uint16_t *)(buffer + offset));
+        uint16_t attr_len = ntohs(*(uint16_t *)(buffer + offset + 2));
+        offset += 4;
+        
+        if (offset + attr_len > n) break;
+        
+        if ((attr_type == 0x0020 || attr_type == 0x0001) && attr_len >= 8) {
+            uint8_t family = buffer[offset + 1];
+            if (family == 0x01) {
+                uint16_t port_val = (buffer[offset + 2] << 8) | buffer[offset + 3];
+                uint32_t addr = (buffer[offset + 4] << 24) | (buffer[offset + 5] << 16) |
+                               (buffer[offset + 6] << 8) | buffer[offset + 7];
+                
+                if (attr_type == 0x0020) {
+                    port_val ^= (0x2112A442 >> 16);
+                    addr ^= 0x2112A442;
+                }
+                
+                struct in_addr ina;
+                ina.s_addr = htonl(addr);
+                inet_ntop(AF_INET, &ina, public_ip, ip_size);
+                *public_port = port_val;
+                return 1;
+            }
+        }
+        
+        offset += attr_len;
+        if (attr_len % 4) offset += 4 - (attr_len % 4);
+    }
+    
+    return 0;
+}
 
 // Input method enumeration
 typedef enum {
@@ -438,6 +558,15 @@ void send_command(unsigned char cmd_code, void *payload, int payload_size) {
     }
     sendto(sockfd, buffer, 1 + payload_size, 0,
            (struct sockaddr*)&server_addr, sizeof(server_addr));
+}
+
+static int get_local_port(void) {
+    struct sockaddr_in6 local_addr;
+    socklen_t len = sizeof(local_addr);
+    if (getsockname(sockfd, (struct sockaddr*)&local_addr, &len) == 0) {
+        return ntohs(local_addr.sin6_port);
+    }
+    return -1;
 }
 
 static void onboarding_reset(void) {
@@ -873,12 +1002,41 @@ int main(int argc, char *argv[]) {
     // Set MSAA mode
     setActiveMSAA(use_msaa);
     
-    printf("Enter server IPv6 address (e.g., ::1 or fe80::1): ");
+    printf("Enter server IPv6 address (e.g., ::1 or [::1]:8080): ");
     if (fgets(server_ip, sizeof(server_ip), stdin) == NULL) {
         fprintf(stderr, "Failed to read server address\n");
         exit(1);
     }
     server_ip[strcspn(server_ip, "\n")] = '\0';
+
+    // Parse address and optional port
+    char addr_only[256];
+    int port = 53847;  // Default port
+    
+    // Check for bracketed IPv6 with port: [::1]:8080
+    if (server_ip[0] == '[') {
+        char *bracket_end = strchr(server_ip, ']');
+        if (bracket_end != NULL) {
+            // Extract address between brackets
+            size_t addr_len = bracket_end - server_ip - 1;
+            strncpy(addr_only, server_ip + 1, addr_len);
+            addr_only[addr_len] = '\0';
+            
+            // Check for port after bracket
+            if (bracket_end[1] == ':') {
+                port = atoi(bracket_end + 2);
+                if (port <= 0 || port > 65535) {
+                    fprintf(stderr, "Invalid port number\n");
+                    exit(1);
+                }
+            }
+        } else {
+            strcpy(addr_only, server_ip);
+        }
+    } else {
+        // Plain address without brackets
+        strcpy(addr_only, server_ip);
+    }
 
     sockfd = socket(AF_INET6, SOCK_DGRAM, 0);
     if (sockfd < 0) {
@@ -886,11 +1044,28 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    // Query STUN to get public endpoint before connecting
+    char public_ip[INET_ADDRSTRLEN];
+    int public_port = 0;
+    struct sockaddr_in6 local_addr;
+    socklen_t local_len = sizeof(local_addr);
+    
+    // Need to send something first to establish a local binding
+    // We'll use a dummy STUN request for this
+    if (query_stun_server(STUN_SERVER_ADDRESS, STUN_SERVER_PORT, sockfd, public_ip, sizeof(public_ip), &public_port)) {
+        // Get local port after STUN query
+        if (getsockname(sockfd, (struct sockaddr *)&local_addr, &local_len) == 0) {
+            int local_port = ntohs(local_addr.sin6_port);
+            printf("Local port: %d\n", local_port);
+        }
+        printf("Public endpoint: %s:%d\n", public_ip, public_port);
+    }
+
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin6_family = AF_INET6;
-    server_addr.sin6_port = htons(53847);
-    if (inet_pton(AF_INET6, server_ip, &server_addr.sin6_addr) <= 0) {
-        fprintf(stderr, "Invalid IPv6 address: %s\n", server_ip);
+    server_addr.sin6_port = htons(port);
+    if (inet_pton(AF_INET6, addr_only, &server_addr.sin6_addr) <= 0) {
+        fprintf(stderr, "Invalid IPv6 address: %s\n", addr_only);
         close(sockfd);
         exit(1);
     }
@@ -908,10 +1083,14 @@ int main(int argc, char *argv[]) {
 
     // Try to login
     for (int attempt = 0; attempt < 12 && !connected; attempt++) {
-        printf("\rAttempt %02d: Sending LOGIN...", attempt + 1);
-        fflush(stdout);
-        
         send_command(CMD_LOGIN, NULL, 0);
+        int local_port = get_local_port();
+        if (local_port > 0) {
+            printf("\rAttempt %02d: Sending LOGIN... (local port %d)", attempt + 1, local_port);
+        } else {
+            printf("\rAttempt %02d: Sending LOGIN...", attempt + 1);
+        }
+        fflush(stdout);
         
         unsigned char buffer[MAX_CMD_SIZE];
         struct sockaddr_in6 from_addr;

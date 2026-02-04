@@ -6,15 +6,151 @@
 #include <netinet/in.h>
 #include <time.h>
 #include <pthread.h>
+#include <netdb.h>
 #include "game.h"
 
 #define INTERVAL_NS (16666667L)  // 60 FPS
 #define MAX_CMD_SIZE 256
 #define SHOOT_COOLDOWN 4.0  // 4 seconds between shots
 
+#define STUN_SERVER_ADDRESS "stun.l.google.com"
+#define STUN_SERVER_PORT 19302
+
 // Keep onboarding chunks below typical MTU to avoid IPv6/UDP fragmentation issues.
 // 1200 is conservative and generally safe across LAN/Wi-Fi.
 #define ONBOARDING_CHUNK_SIZE 1200
+
+// Query STUN server to discover public IP:port (returns 1 on success, 0 on failure)
+int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *public_ip, int ip_size, int *public_port) {
+    // Build STUN Binding Request
+    uint8_t request[20];
+    uint16_t msg_type = htons(0x0001);       // Binding Request
+    uint16_t msg_len = htons(0);             // No attributes
+    uint32_t magic_cookie = htonl(0x2112A442);
+    uint8_t transaction_id[12];
+    for (int i = 0; i < 12; i++) transaction_id[i] = rand() & 0xFF;
+    
+    memcpy(request, &msg_type, 2);
+    memcpy(request + 2, &msg_len, 2);
+    memcpy(request + 4, &magic_cookie, 4);
+    memcpy(request + 8, transaction_id, 12);
+    
+    // Resolve STUN server
+    struct addrinfo hints, *res, *rp;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_DGRAM;
+    
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", stun_port);
+    
+    if (getaddrinfo(stun_host, port_str, &hints, &res) != 0) {
+        printf("Failed to resolve STUN server %s\n", stun_host);
+        return 0;
+    }
+    
+    // Send request to first available address
+    int sent = 0;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        if (rp->ai_family == AF_INET) {
+            // Map IPv4 to IPv6
+            struct sockaddr_in *sin4 = (struct sockaddr_in *)rp->ai_addr;
+            struct sockaddr_in6 sin6;
+            memset(&sin6, 0, sizeof(sin6));
+            sin6.sin6_family = AF_INET6;
+            sin6.sin6_port = sin4->sin_port;
+            sin6.sin6_addr.s6_addr[10] = 0xff;
+            sin6.sin6_addr.s6_addr[11] = 0xff;
+            memcpy(&sin6.sin6_addr.s6_addr[12], &sin4->sin_addr, 4);
+            if (sendto(sockfd, request, sizeof(request), 0, (struct sockaddr *)&sin6, sizeof(sin6)) >= 0) {
+                sent = 1;
+                break;
+            }
+        } else if (rp->ai_family == AF_INET6) {
+            if (sendto(sockfd, request, sizeof(request), 0, rp->ai_addr, rp->ai_addrlen) >= 0) {
+                sent = 1;
+                break;
+            }
+        }
+    }
+    
+    freeaddrinfo(res);
+    
+    if (!sent) {
+        printf("Failed to send STUN request\n");
+        return 0;
+    }
+    
+    // Save original socket timeout
+    struct timeval tv_orig;
+    socklen_t tv_len = sizeof(tv_orig);
+    getsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, &tv_len);
+    
+    // Set receive timeout for STUN query
+    struct timeval tv;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    uint8_t buffer[2048];
+    struct sockaddr_in6 from;
+    socklen_t fromlen = sizeof(from);
+    ssize_t n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &fromlen);
+    
+    // Restore original socket timeout
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, sizeof(tv_orig));
+    
+    if (n < 20) {
+        printf("No STUN response or response too short\n");
+        return 0;
+    }
+    
+    // Parse STUN response
+    uint16_t resp_type = ntohs(*(uint16_t *)(buffer));
+    uint16_t resp_len = ntohs(*(uint16_t *)(buffer + 2));
+    uint32_t resp_cookie = ntohl(*(uint32_t *)(buffer + 4));
+    
+    if (resp_cookie != 0x2112A442) {
+        printf("Invalid STUN magic cookie in response\n");
+        return 0;
+    }
+    
+    // Parse attributes
+    int offset = 20;
+    while (offset + 4 <= n && offset < 20 + resp_len) {
+        uint16_t attr_type = ntohs(*(uint16_t *)(buffer + offset));
+        uint16_t attr_len = ntohs(*(uint16_t *)(buffer + offset + 2));
+        offset += 4;
+        
+        if (offset + attr_len > n) break;
+        
+        // XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001)
+        if ((attr_type == 0x0020 || attr_type == 0x0001) && attr_len >= 8) {
+            uint8_t family = buffer[offset + 1];
+            if (family == 0x01) {  // IPv4
+                uint16_t port = (buffer[offset + 2] << 8) | buffer[offset + 3];
+                uint32_t addr = (buffer[offset + 4] << 24) | (buffer[offset + 5] << 16) |
+                               (buffer[offset + 6] << 8) | buffer[offset + 7];
+                
+                if (attr_type == 0x0020) {  // XOR-MAPPED
+                    port ^= (0x2112A442 >> 16);
+                    addr ^= 0x2112A442;
+                }
+                
+                struct in_addr ina;
+                ina.s_addr = htonl(addr);
+                inet_ntop(AF_INET, &ina, public_ip, ip_size);
+                *public_port = port;
+                return 1;
+            }
+        }
+        
+        offset += attr_len;
+        if (attr_len % 4) offset += 4 - (attr_len % 4);
+    }
+    
+    printf("No mapped address found in STUN response\n");
+    return 0;
+}
 
 typedef struct connection_info {
     struct sockaddr_in6 addr;
@@ -92,6 +228,7 @@ static int receiver_terminated = 0;
 static int swapper_terminated = 0;
 static int producer_terminated = 0;
 static pthread_t pinger_thread_id;
+static pthread_t stdin_thread_id;
 static int server_sockfd;  // Global socket for sending
 
 // Game timing
@@ -502,6 +639,22 @@ void receiver() {
         exit(1);
     }
 
+    // Query STUN server to get public IP:port
+    char public_ip[INET_ADDRSTRLEN];
+    int public_port = 0;
+    struct sockaddr_in6 local_addr;
+    socklen_t local_len = sizeof(local_addr);
+    getsockname(server_sockfd, (struct sockaddr *)&local_addr, &local_len);
+    int local_port = ntohs(local_addr.sin6_port);
+    
+    printf("Local port: %d\n", local_port);
+    
+    if (query_stun_server(STUN_SERVER_ADDRESS, STUN_SERVER_PORT, server_sockfd, public_ip, sizeof(public_ip), &public_port)) {
+        printf("Public endpoint: %s:%d\n", public_ip, public_port);
+    } else {
+        printf("Failed to query STUN server\n");
+    }
+    
     printf("Game server listening on port 53847...\n");
     fflush(stdout);
 
@@ -804,6 +957,86 @@ void consumer() {
     }
 }
 
+void stdin_command_reader() {
+    char input[512];
+    printf("\nType IP:port to ping (e.g., 192.168.1.100:12345 or [::1]:8080)\n");
+    fflush(stdout);
+    
+    while (1) {
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            break;
+        }
+        
+        // Remove newline
+        input[strcspn(input, "\n")] = '\0';
+        
+        if (strlen(input) == 0) continue;
+        
+        // Parse IP:port
+        char addr_str[256];
+        int port = 0;
+        
+        // Check for bracketed IPv6 format [::1]:port
+        if (input[0] == '[') {
+            char *bracket_end = strchr(input, ']');
+            if (bracket_end && bracket_end[1] == ':') {
+                size_t addr_len = bracket_end - input - 1;
+                strncpy(addr_str, input + 1, addr_len);
+                addr_str[addr_len] = '\0';
+                port = atoi(bracket_end + 2);
+            } else {
+                printf("Invalid format. Use [IPv6]:port\n");
+                continue;
+            }
+        } else {
+            // IPv4 format or plain IPv6
+            char *colon = strrchr(input, ':');
+            if (colon) {
+                size_t addr_len = colon - input;
+                strncpy(addr_str, input, addr_len);
+                addr_str[addr_len] = '\0';
+                port = atoi(colon + 1);
+            } else {
+                printf("Invalid format. Use IP:port\n");
+                continue;
+            }
+        }
+        
+        if (port <= 0 || port > 65535) {
+            printf("Invalid port: %d\n", port);
+            continue;
+        }
+        
+        // Try to parse as IPv6 first, then IPv4-mapped
+        struct sockaddr_in6 target;
+        memset(&target, 0, sizeof(target));
+        target.sin6_family = AF_INET6;
+        target.sin6_port = htons(port);
+        
+        if (inet_pton(AF_INET6, addr_str, &target.sin6_addr) == 1) {
+            // Valid IPv6
+            unsigned char ping[1] = {CMD_PING};
+            sendto(server_sockfd, ping, 1, 0, (struct sockaddr*)&target, sizeof(target));
+            printf("Sent ping to [%s]:%d\n", addr_str, port);
+        } else {
+            // Try IPv4
+            struct in_addr ipv4;
+            if (inet_pton(AF_INET, addr_str, &ipv4) == 1) {
+                // Map to IPv6
+                target.sin6_addr.s6_addr[10] = 0xff;
+                target.sin6_addr.s6_addr[11] = 0xff;
+                memcpy(&target.sin6_addr.s6_addr[12], &ipv4, 4);
+                unsigned char ping[1] = {CMD_PING};
+                sendto(server_sockfd, ping, 1, 0, (struct sockaddr*)&target, sizeof(target));
+                printf("Sent ping to %s:%d\n", addr_str, port);
+            } else {
+                printf("Invalid IP address: %s\n", addr_str);
+            }
+        }
+        fflush(stdout);
+    }
+}
+
 void server_ctrlcHandler(int signum) {
     unsigned char terminate[1] = {CMD_TERMINATE};
     for (int i = 0; i < 512; i++) {
@@ -813,6 +1046,7 @@ void server_ctrlcHandler(int signum) {
                 subscribers[i].addr_len);
         }
     }
+    pthread_cancel(stdin_thread_id);
     printf("\nCTRL-C detected. TERMINATE sent to subscribers. Exiting.\n");
     fflush(stdout);
     exit(0);
@@ -848,7 +1082,7 @@ int main() {
 
     signal(SIGINT, server_ctrlcHandler);
 
-    pthread_t recv_thread, swap_thread, cons_thread, send_thread, ping_thread;
+    pthread_t recv_thread, swap_thread, cons_thread, send_thread, ping_thread, stdin_thread;
 
     if (pthread_create(&recv_thread, NULL, (void *(*)(void *))receiver, NULL) != 0) {
         perror("pthread_create receiver");
@@ -871,6 +1105,13 @@ int main() {
         return 1;
     }
     pinger_thread_id = ping_thread;
+    
+    if (pthread_create(&stdin_thread, NULL, (void *(*)(void *))stdin_command_reader, NULL) != 0) {
+        perror("pthread_create stdin_reader");
+        return 1;
+    }
+    stdin_thread_id = stdin_thread;
+    pthread_detach(stdin_thread);  // Detach since we won't join it
 
     pthread_join(recv_thread, NULL);
     pthread_join(swap_thread, NULL);
