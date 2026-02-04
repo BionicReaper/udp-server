@@ -148,25 +148,37 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
     }
     
     // Parse attributes
+    printf("STUN: Parsing attributes (response length: %d, total: %d)...\n", resp_len, (int)n);
     int offset = 20;
+    int attr_count = 0;
     while (offset + 4 <= n && offset < 20 + resp_len) {
         uint16_t attr_type = ntohs(*(uint16_t *)(buffer + offset));
         uint16_t attr_len = ntohs(*(uint16_t *)(buffer + offset + 2));
+        attr_count++;
+        printf("STUN: Attribute #%d: type=0x%04x, len=%d\n", attr_count, attr_type, attr_len);
         offset += 4;
         
-        if (offset + attr_len > n) break;
+        if (offset + attr_len > n) {
+            printf("STUN: Attribute extends beyond response, stopping\n");
+            break;
+        }
         
         // XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001)
         if ((attr_type == 0x0020 || attr_type == 0x0001) && attr_len >= 8) {
             uint8_t family = buffer[offset + 1];
+            printf("STUN: Found %s attribute, family=0x%02x\n", 
+                   attr_type == 0x0020 ? "XOR-MAPPED-ADDRESS" : "MAPPED-ADDRESS", family);
             if (family == 0x01) {  // IPv4
                 uint16_t port = (buffer[offset + 2] << 8) | buffer[offset + 3];
                 uint32_t addr = (buffer[offset + 4] << 24) | (buffer[offset + 5] << 16) |
                                (buffer[offset + 6] << 8) | buffer[offset + 7];
                 
+                printf("STUN: Raw port=0x%04x, addr=0x%08x\n", port, addr);
+                
                 if (attr_type == 0x0020) {  // XOR-MAPPED
                     port ^= (0x2112A442 >> 16);
                     addr ^= 0x2112A442;
+                    printf("STUN: After XOR: port=%d, addr=0x%08x\n", port, addr);
                 }
                 
                 struct in_addr ina;
@@ -175,6 +187,30 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
                 *public_port = port;
                 printf("STUN: Successfully discovered public address\n");
                 return 1;
+            } else if (family == 0x02 && attr_len >= 20) {  // IPv6
+                uint16_t port = (buffer[offset + 2] << 8) | buffer[offset + 3];
+                uint8_t addr6[16];
+                memcpy(addr6, buffer + offset + 4, 16);
+                
+                if (attr_type == 0x0020) {  // XOR-MAPPED
+                    port ^= (0x2112A442 >> 16);
+                    // XOR with magic cookie + transaction ID
+                    uint8_t xor_data[16];
+                    memcpy(xor_data, buffer + 4, 4);  // magic cookie
+                    memcpy(xor_data + 4, buffer + 8, 12);  // transaction ID
+                    for (int i = 0; i < 16; i++) {
+                        addr6[i] ^= xor_data[i];
+                    }
+                }
+                
+                struct in6_addr in6;
+                memcpy(&in6, addr6, 16);
+                inet_ntop(AF_INET6, &in6, public_ip, ip_size);
+                *public_port = port;
+                printf("STUN: Successfully discovered public IPv6 address\n");
+                return 1;
+            } else {
+                printf("STUN: Unsupported address family 0x%02x\n", family);
             }
         }
         
