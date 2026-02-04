@@ -977,6 +977,7 @@ void reset_key_states() {
 int main(int argc, char *argv[]) {
     char server_ip[256];
     int use_msaa = 1;  // Default to MSAA on
+    int client_port = 0;  // 0 means OS assigns random port
     
     // Register cleanup handler - runs on any exit
     atexit(cleanup_all);
@@ -985,6 +986,13 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--noaa") == 0) {
             use_msaa = 0;
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            client_port = atoi(argv[i + 1]);
+            if (client_port <= 0 || client_port > 65535) {
+                fprintf(stderr, "Invalid client port number: %s\n", argv[i + 1]);
+                exit(1);
+            }
+            i++;  // Skip next argument
         }
     }
     
@@ -1031,6 +1039,22 @@ int main(int argc, char *argv[]) {
     if (sockfd < 0) {
         perror("socket failed");
         exit(1);
+    }
+
+    // Bind to specific port if requested
+    if (client_port > 0) {
+        struct sockaddr_in6 bind_addr;
+        memset(&bind_addr, 0, sizeof(bind_addr));
+        bind_addr.sin6_family = AF_INET6;
+        bind_addr.sin6_addr = in6addr_any;
+        bind_addr.sin6_port = htons(client_port);
+        
+        if (bind(sockfd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+            perror("bind failed");
+            close(sockfd);
+            exit(1);
+        }
+        printf("Bound to local port %d\n", client_port);
     }
 
     // Query STUN to get public endpoint before connecting
