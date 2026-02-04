@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <math.h>
 #include <netdb.h>
+#include <errno.h>
 #include "game.h"
 
 // Try to include evdev support
@@ -57,6 +58,7 @@ static int query_stun_server(const char *stun_host, int stun_port, int sockfd, c
     snprintf(port_str, sizeof(port_str), "%d", stun_port);
     
     if (getaddrinfo(stun_host, port_str, &hints, &res) != 0) {
+        printf("STUN: Failed to resolve %s\n", stun_host);
         return 0;
     }
     
@@ -65,14 +67,20 @@ static int query_stun_server(const char *stun_host, int stun_port, int sockfd, c
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         if (rp->ai_family == AF_INET6) {
             if (sendto(sockfd, request, sizeof(request), 0, rp->ai_addr, rp->ai_addrlen) >= 0) {
+                printf("STUN: Request sent to %s\n", stun_host);
                 sent = 1;
                 break;
+            } else {
+                printf("STUN: Send failed: %s\n", strerror(errno));
             }
         }
     }
     
     freeaddrinfo(res);
-    if (!sent) return 0;
+    if (!sent) {
+        printf("STUN: No IPv6 address available or send failed\n");
+        return 0;
+    }
     
     // Save original socket timeout
     struct timeval tv_orig;
@@ -93,11 +101,23 @@ static int query_stun_server(const char *stun_host, int stun_port, int sockfd, c
     // Restore original socket timeout
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, sizeof(tv_orig));
     
-    if (n < 20) return 0;
+    if (n < 20) {
+        if (n < 0) {
+            printf("STUN: No response (timeout or error: %s)\n", strerror(errno));
+        } else {
+            printf("STUN: Response too short (%zd bytes)\n", n);
+        }
+        return 0;
+    }
+    
+    printf("STUN: Received %zd byte response\n", n);
     
     // Parse STUN response
     uint32_t resp_cookie = ntohl(*(uint32_t *)(buffer + 4));
-    if (resp_cookie != 0x2112A442) return 0;
+    if (resp_cookie != 0x2112A442) {
+        printf("STUN: Invalid magic cookie (0x%08x)\n", resp_cookie);
+        return 0;
+    }
     
     uint16_t resp_len = ntohs(*(uint16_t *)(buffer + 2));
     int offset = 20;
@@ -124,6 +144,7 @@ static int query_stun_server(const char *stun_host, int stun_port, int sockfd, c
                 ina.s_addr = htonl(addr);
                 inet_ntop(AF_INET, &ina, public_ip, ip_size);
                 *public_port = port_val;
+                printf("STUN: Successfully discovered public address\n");
                 return 1;
             }
         }
@@ -132,6 +153,7 @@ static int query_stun_server(const char *stun_host, int stun_port, int sockfd, c
         if (attr_len % 4) offset += 4 - (attr_len % 4);
     }
     
+    printf("STUN: No mapped address in response\n");
     return 0;
 }
 

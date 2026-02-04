@@ -7,6 +7,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <netdb.h>
+#include <errno.h>
 #include "game.h"
 
 #define INTERVAL_NS (16666667L)  // 60 FPS
@@ -44,7 +45,7 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
     snprintf(port_str, sizeof(port_str), "%d", stun_port);
     
     if (getaddrinfo(stun_host, port_str, &hints, &res) != 0) {
-        printf("Failed to resolve STUN server %s\n", stun_host);
+        printf("STUN: Failed to resolve STUN server %s\n", stun_host);
         return 0;
     }
     
@@ -58,20 +59,30 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         if (rp->ai_family == AF_INET6 && !ipv6_addr) {
             ipv6_addr = rp;
+            printf("STUN: Found IPv6 address for %s\n", stun_host);
         } else if (rp->ai_family == AF_INET && !ipv4_addr) {
             ipv4_addr = rp;
+            char ip_str[INET_ADDRSTRLEN];
+            struct sockaddr_in *sin = (struct sockaddr_in *)rp->ai_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
+            printf("STUN: Found IPv4 address %s for %s\n", ip_str, stun_host);
         }
     }
     
     // Try IPv6 first
     if (ipv6_addr) {
+        printf("STUN: Trying IPv6 address...\n");
         if (sendto(sockfd, request, sizeof(request), 0, ipv6_addr->ai_addr, ipv6_addr->ai_addrlen) >= 0) {
+            printf("STUN: Request sent via IPv6\n");
             sent = 1;
+        } else {
+            printf("STUN: Failed to send via IPv6: %s\n", strerror(errno));
         }
     }
     
     // If IPv6 failed or not available, try IPv4 with automatic mapping
     if (!sent && ipv4_addr) {
+        printf("STUN: Trying IPv4-mapped IPv6 address...\n");
         struct sockaddr_in *sin4 = (struct sockaddr_in *)ipv4_addr->ai_addr;
         struct sockaddr_in6 sin6;
         memset(&sin6, 0, sizeof(sin6));
@@ -82,14 +93,17 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
         sin6.sin6_addr.s6_addr[11] = 0xff;
         memcpy(&sin6.sin6_addr.s6_addr[12], &sin4->sin_addr, 4);
         if (sendto(sockfd, request, sizeof(request), 0, (struct sockaddr *)&sin6, sizeof(sin6)) >= 0) {
+            printf("STUN: Request sent via IPv4-mapped IPv6\n");
             sent = 1;
+        } else {
+            printf("STUN: Failed to send via IPv4-mapped: %s\n", strerror(errno));
         }
     }
     
     freeaddrinfo(res);
     
     if (!sent) {
-        printf("Failed to send STUN request\n");
+        printf("STUN: Failed to send request (no working address family)\n");
         return 0;
     }
     
@@ -113,9 +127,15 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, sizeof(tv_orig));
     
     if (n < 20) {
-        printf("No STUN response or response too short\n");
+        if (n < 0) {
+            printf("STUN: No response received (timeout or error: %s)\n", strerror(errno));
+        } else {
+            printf("STUN: Response too short (%zd bytes, expected at least 20)\n", n);
+        }
         return 0;
     }
+    
+    printf("STUN: Received %zd byte response\n", n);
     
     // Parse STUN response
     uint16_t resp_type = ntohs(*(uint16_t *)(buffer));
@@ -123,7 +143,7 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
     uint32_t resp_cookie = ntohl(*(uint32_t *)(buffer + 4));
     
     if (resp_cookie != 0x2112A442) {
-        printf("Invalid STUN magic cookie in response\n");
+        printf("STUN: Invalid magic cookie in response (0x%08x, expected 0x2112A442)\n", resp_cookie);
         return 0;
     }
     
@@ -153,6 +173,7 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
                 ina.s_addr = htonl(addr);
                 inet_ntop(AF_INET, &ina, public_ip, ip_size);
                 *public_port = port;
+                printf("STUN: Successfully discovered public address\n");
                 return 1;
             }
         }
@@ -161,7 +182,7 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
         if (attr_len % 4) offset += 4 - (attr_len % 4);
     }
     
-    printf("No mapped address found in STUN response\n");
+    printf("STUN: No mapped address found in response (parsed %d bytes of attributes)\n", offset - 20);
     return 0;
 }
 
