@@ -49,27 +49,40 @@ int query_stun_server(const char *stun_host, int stun_port, int sockfd, char *pu
     }
     
     // Send request to first available address
+    // Try IPv6 first, then IPv4 with automatic mapping via IPV6_V6ONLY=0
     int sent = 0;
+    struct addrinfo *ipv6_addr = NULL;
+    struct addrinfo *ipv4_addr = NULL;
+    
+    // Scan for IPv6 and IPv4 addresses
     for (rp = res; rp != NULL; rp = rp->ai_next) {
-        if (rp->ai_family == AF_INET) {
-            // Map IPv4 to IPv6
-            struct sockaddr_in *sin4 = (struct sockaddr_in *)rp->ai_addr;
-            struct sockaddr_in6 sin6;
-            memset(&sin6, 0, sizeof(sin6));
-            sin6.sin6_family = AF_INET6;
-            sin6.sin6_port = sin4->sin_port;
-            sin6.sin6_addr.s6_addr[10] = 0xff;
-            sin6.sin6_addr.s6_addr[11] = 0xff;
-            memcpy(&sin6.sin6_addr.s6_addr[12], &sin4->sin_addr, 4);
-            if (sendto(sockfd, request, sizeof(request), 0, (struct sockaddr *)&sin6, sizeof(sin6)) >= 0) {
-                sent = 1;
-                break;
-            }
-        } else if (rp->ai_family == AF_INET6) {
-            if (sendto(sockfd, request, sizeof(request), 0, rp->ai_addr, rp->ai_addrlen) >= 0) {
-                sent = 1;
-                break;
-            }
+        if (rp->ai_family == AF_INET6 && !ipv6_addr) {
+            ipv6_addr = rp;
+        } else if (rp->ai_family == AF_INET && !ipv4_addr) {
+            ipv4_addr = rp;
+        }
+    }
+    
+    // Try IPv6 first
+    if (ipv6_addr) {
+        if (sendto(sockfd, request, sizeof(request), 0, ipv6_addr->ai_addr, ipv6_addr->ai_addrlen) >= 0) {
+            sent = 1;
+        }
+    }
+    
+    // If IPv6 failed or not available, try IPv4 with automatic mapping
+    if (!sent && ipv4_addr) {
+        struct sockaddr_in *sin4 = (struct sockaddr_in *)ipv4_addr->ai_addr;
+        struct sockaddr_in6 sin6;
+        memset(&sin6, 0, sizeof(sin6));
+        sin6.sin6_family = AF_INET6;
+        sin6.sin6_port = sin4->sin_port;
+        // Create IPv4-mapped IPv6 address: ::ffff:x.x.x.x
+        sin6.sin6_addr.s6_addr[10] = 0xff;
+        sin6.sin6_addr.s6_addr[11] = 0xff;
+        memcpy(&sin6.sin6_addr.s6_addr[12], &sin4->sin_addr, 4);
+        if (sendto(sockfd, request, sizeof(request), 0, (struct sockaddr *)&sin6, sizeof(sin6)) >= 0) {
+            sent = 1;
         }
     }
     

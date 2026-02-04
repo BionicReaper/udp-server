@@ -49,7 +49,9 @@ static int query_stun_server(const char *stun_host, int stun_port, int sockfd, c
     // Resolve STUN server
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET6;
     hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_V4MAPPED | AI_ALL;
     
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", stun_port);
@@ -61,20 +63,7 @@ static int query_stun_server(const char *stun_host, int stun_port, int sockfd, c
     // Send request to first available address
     int sent = 0;
     for (rp = res; rp != NULL; rp = rp->ai_next) {
-        if (rp->ai_family == AF_INET) {
-            struct sockaddr_in *sin4 = (struct sockaddr_in *)rp->ai_addr;
-            struct sockaddr_in6 sin6;
-            memset(&sin6, 0, sizeof(sin6));
-            sin6.sin6_family = AF_INET6;
-            sin6.sin6_port = sin4->sin_port;
-            sin6.sin6_addr.s6_addr[10] = 0xff;
-            sin6.sin6_addr.s6_addr[11] = 0xff;
-            memcpy(&sin6.sin6_addr.s6_addr[12], &sin4->sin_addr, 4);
-            if (sendto(sockfd, request, sizeof(request), 0, (struct sockaddr *)&sin6, sizeof(sin6)) >= 0) {
-                sent = 1;
-                break;
-            }
-        } else if (rp->ai_family == AF_INET6) {
+        if (rp->ai_family == AF_INET6) {
             if (sendto(sockfd, request, sizeof(request), 0, rp->ai_addr, rp->ai_addrlen) >= 0) {
                 sent = 1;
                 break;
