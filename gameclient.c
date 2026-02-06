@@ -1272,8 +1272,6 @@ int main(int argc, char *argv[]) {
         short rotating = (rot_dir != 0);
         
         int forward_changed = (fabs(forward - prev_forward) > EPSILON);
-        if(forward_changed)
-        printf("Forward: %.f (prev: %.f)\n", forward, prev_forward);
         int right_changed = (fabs(right - prev_right) > EPSILON);
         int up_changed = (fabs(up - prev_up) > EPSILON);
         int rot_changed = (rot_dir != prev_rot_dir);
