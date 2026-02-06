@@ -97,6 +97,11 @@ static int query_stun_server(const char *stun_host, int stun_port, int sockfd, c
     struct sockaddr_in6 from;
     socklen_t fromlen = sizeof(from);
     ssize_t n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &fromlen);
+
+    for(int i = 0; i < 44; i++) {
+        // Print the hex code of each received byte for debugging (up to 44 bytes)
+        printf ("STUN: Byte %d: 0x%02x\n", i, (i < n) ? buffer[i] : 0);
+    }
     
     // Restore original socket timeout
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, sizeof(tv_orig));
