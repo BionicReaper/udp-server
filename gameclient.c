@@ -97,11 +97,6 @@ static int query_stun_server(const char *stun_host, int stun_port, int sockfd, c
     struct sockaddr_in6 from;
     socklen_t fromlen = sizeof(from);
     ssize_t n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &fromlen);
-
-    for(int i = 0; i < 44; i++) {
-        // Print the hex code of each received byte for debugging (up to 44 bytes)
-        printf ("STUN: Byte %d: 0x%02x\n", i, (i < n) ? buffer[i] : 0);
-    }
     
     // Restore original socket timeout
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, sizeof(tv_orig));
@@ -1121,7 +1116,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Query STUN to get public endpoint before connecting
-    char public_ip[INET_ADDRSTRLEN];
+    char public_ip[INET6_ADDRSTRLEN];
     int public_port = 0;
     struct sockaddr_in6 local_addr;
     socklen_t local_len = sizeof(local_addr);
