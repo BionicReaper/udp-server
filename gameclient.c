@@ -1153,7 +1153,7 @@ int main(int argc, char *argv[]) {
     onboarding_reset();
 
     // Try to login
-    for (int attempt = 0; attempt < 12 && !connected; attempt++) {
+    for (int attempt = 0; attempt < 60 && !connected; attempt++) {
         send_command(CMD_LOGIN, NULL, 0);
         int local_port = get_local_port();
         if (local_port > 0) {
