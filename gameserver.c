@@ -710,7 +710,7 @@ void receiver() {
     }
 
     // Query STUN server to get public IP:port
-    char public_ip[INET_ADDRSTRLEN];
+    char public_ip[INET6_ADDRSTRLEN];
     int public_port = 0;
     struct sockaddr_in6 local_addr;
     socklen_t local_len = sizeof(local_addr);
