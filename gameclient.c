@@ -1170,6 +1170,7 @@ int main(int argc, char *argv[]) {
         int n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
                          (struct sockaddr*)&from_addr, &from_len);
         if (n > 0) {
+            printf("Received response from server, length %d bytes", n);
             unsigned char code = buffer[0];
             if (code == CMD_ONBOARDING) {
                 handle_onboarding(buffer + 1, n - 1);
